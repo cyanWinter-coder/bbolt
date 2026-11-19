@@ -245,6 +245,25 @@ if err != nil {
 fmt.Println("Allocated ID %d", id)
 ```
 
+`DB.BatchContext()` is a context-aware variant of `DB.Batch()` for callers
+that need to bound how long they wait for a batch result:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+defer cancel()
+err := db.BatchContext(ctx, func(tx *bolt.Tx) error {
+	...
+	return nil
+})
+```
+
+If the context is canceled before the batch's transaction commits,
+`BatchContext` returns the context's error immediately without waiting. The
+batch itself keeps running to completion, so one caller's cancellation never
+blocks other callers in the same batch, nor any subsequent batch. If the batch
+finishes first, its result is returned even when cancellation happens at the
+same time. `DB.Batch()` is equivalent to `DB.BatchContext(context.Background(), fn)`.
+
 
 #### Managing transactions manually
 

@@ -10,6 +10,18 @@ import (
 	"go.etcd.io/bbolt/errors"
 )
 
+// PendingBatchCallCount returns the number of calls currently queued in the
+// pending batch, or 0 when there is no pending batch. It is intended for
+// tests in the external test package that need to observe batching state.
+func (db *DB) PendingBatchCallCount() int {
+	db.batchMu.Lock()
+	defer db.batchMu.Unlock()
+	if db.batch == nil {
+		return 0
+	}
+	return len(db.batch.calls)
+}
+
 func TestOpenWithPreLoadFreelist(t *testing.T) {
 	testCases := []struct {
 		name                    string

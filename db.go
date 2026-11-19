@@ -1,6 +1,7 @@
 package bbolt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -977,8 +978,39 @@ func (db *DB) View(fn func(*Tx) error) error {
 // and DB.MaxBatchDelay, respectively.
 //
 // Batch is only useful when there are multiple goroutines calling it.
+//
+// Batch is a wrapper around BatchContext with context.Background(), so
+// it cannot be canceled while waiting to join or run in a batch.
 func (db *DB) Batch(fn func(*Tx) error) error {
-	errCh := make(chan error, 1)
+	return db.BatchContext(context.Background(), fn)
+}
+
+// BatchContext is like Batch, but it accepts a context so the caller can
+// give up waiting for the batch result.
+//
+// If ctx is canceled before the batch's transaction commits, BatchContext
+// returns the context's error (context.Canceled or context.DeadlineExceeded)
+// without waiting for the batch to finish. The batch itself is not
+// interrupted: the call remains part of its batch and still runs to
+// completion, so one caller's cancellation never blocks other callers in
+// the same batch, nor any subsequent batch. If the batch finishes first,
+// BatchContext returns the batch result even if ctx is canceled at the
+// same time; exactly one of the two results is ever returned.
+//
+// As with Batch, fn may be invoked multiple times, including after the
+// caller has stopped waiting, so its side effects must be idempotent.
+// When fn fails, the call is retried on its own in a standalone managed
+// transaction, and the database only ever commits complete transactions.
+//
+// Batching is still governed by DB.MaxBatchSize and DB.MaxBatchDelay.
+// A pre-canceled ctx does not bypass batching: the call is still enqueued
+// and coalesced with other concurrent calls, and BatchContext simply
+// returns immediately.
+func (db *DB) BatchContext(ctx context.Context, fn func(*Tx) error) error {
+	c := &call{
+		fn:  fn,
+		err: make(chan error, 1),
+	}
 
 	db.batchMu.Lock()
 	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
@@ -988,30 +1020,41 @@ func (db *DB) Batch(fn func(*Tx) error) error {
 		}
 		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
 	}
-	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
+	db.batch.calls = append(db.batch.calls, c)
 	if len(db.batch.calls) >= db.MaxBatchSize {
 		// wake up batch, it's ready to run
 		go db.batch.trigger()
 	}
 	db.batchMu.Unlock()
 
-	err := <-errCh
-	if err == trySolo {
-		err = db.Update(fn)
+	select {
+	case err := <-c.err:
+		// The batch produced a definitive result first. The channel is
+		// buffered, so the batch goroutine never blocks on callers that
+		// cancel, and a result racing with cancellation is observed
+		// exactly once.
+		if err == trySolo {
+			err = db.Update(fn)
+		}
+		return err
+	case <-ctx.Done():
+		// The caller gave up before a result was available. Do not wait:
+		// the batch keeps running and delivers its result into the
+		// buffered channel on its own.
+		return ctx.Err()
 	}
-	return err
 }
 
 type call struct {
 	fn  func(*Tx) error
-	err chan<- error
+	err chan error
 }
 
 type batch struct {
 	db    *DB
 	timer *time.Timer
 	start sync.Once
-	calls []call
+	calls []*call
 }
 
 // trigger runs the batch if it hasn't already been run.
@@ -1020,7 +1063,7 @@ func (b *batch) trigger() {
 }
 
 // run performs the transactions in the batch and communicates results
-// back to DB.Batch.
+// back to DB.BatchContext.
 func (b *batch) run() {
 	b.db.batchMu.Lock()
 	b.timer.Stop()

@@ -62,6 +62,12 @@ type Bucket struct {
 	//
 	// This is non-persisted across transactions so it must be set in every Tx.
 	FillPercent float64
+
+	// deleted is set once the bucket has been removed from its parent with
+	// DeleteBucket. It only flips from false to true and lets long-lived
+	// iterators (PrefixCursor) detect the terminal state instead of following
+	// stale page references that were released to the freelist.
+	deleted bool
 }
 
 // newBucket returns a new bucket associated with a transaction.
@@ -344,6 +350,10 @@ func (b *Bucket) DeleteBucket(key []byte) (err error) {
 
 	// Remove cached copy.
 	delete(b.buckets, string(newKey))
+
+	// Mark the removed bucket so any PrefixCursor still referencing it fails
+	// with a recognizable terminal error instead of touching freed pages.
+	child.deleted = true
 
 	// Release all bucket pages to freelist.
 	child.nodes = nil

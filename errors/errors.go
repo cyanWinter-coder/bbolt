@@ -90,3 +90,28 @@ var (
 	// of its descendants.
 	ErrCyclicBucketMove = errors.New("the target bucket is the same as or a descendant of the bucket being moved")
 )
+
+// These errors can occur when iterating with a PrefixCursor.
+var (
+	// ErrPrefixDeleteNotAllowed is returned when creating a PrefixCursor that
+	// requests in-traversal deletion from a read-only transaction, or when
+	// PrefixCursor.Delete is called on a PrefixCursor that was created without
+	// allowing deletion.
+	ErrPrefixDeleteNotAllowed = errors.New("prefix cursor: deletion is not allowed")
+
+	// ErrCursorTerminal is returned when a PrefixCursor method is called after
+	// the cursor reached a terminal state: the underlying transaction was
+	// closed or the iterated bucket was deleted. A terminal cursor can never
+	// access its old page references again; create a new PrefixCursor in a new
+	// transaction and reposition it to resume the traversal.
+	ErrCursorTerminal = errors.New("prefix cursor: cursor is in a terminal state")
+
+	// ErrCursorNotPositioned is returned when PrefixCursor.Delete is called
+	// before any of First/Last/Seek/Next positioned the cursor on a key, or
+	// after the prefix range was fully exhausted.
+	ErrCursorNotPositioned = errors.New("prefix cursor: cursor is not positioned on a key")
+
+	// ErrInvalidDirection is returned when creating a PrefixCursor with a
+	// direction other than Forward or Reverse.
+	ErrInvalidDirection = errors.New("prefix cursor: invalid traversal direction")
+)

@@ -692,6 +692,133 @@ func TestTx_Rollback(t *testing.T) {
 	}
 }
 
+// TestTx_Rollback_FreelistConsistency ensures that rolling back a write
+// transaction returns both the pages it freed and the pages it allocated to
+// the freelist, so that subsequent transactions can reuse them and a reopen
+// still sees a consistent freelist with the last committed data intact.
+func TestTx_Rollback_FreelistConsistency(t *testing.T) {
+	for _, noFreelistSync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("NoFreelistSync=%v", noFreelistSync), func(t *testing.T) {
+			db := btesting.MustCreateDBWithOption(t, &bolt.Options{NoFreelistSync: noFreelistSync})
+
+			// Seed some committed data.
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				b, err := tx.CreateBucket([]byte("widgets"))
+				require.NoError(t, err)
+				for i := 0; i < 100; i++ {
+					require.NoError(t, b.Put([]byte(fmt.Sprintf("key-%03d", i)), bytes.Repeat([]byte("v"), 64)))
+				}
+				return nil
+			}))
+
+			// A transaction that frees pages (deletes) and allocates pages
+			// (puts) is rolled back: none of its pages may stay lost.
+			tx, err := db.Begin(true)
+			require.NoError(t, err)
+			b := tx.Bucket([]byte("widgets"))
+			for i := 0; i < 50; i++ {
+				require.NoError(t, b.Delete([]byte(fmt.Sprintf("key-%03d", i))))
+			}
+			for i := 0; i < 50; i++ {
+				require.NoError(t, b.Put([]byte(fmt.Sprintf("new-%03d", i)), bytes.Repeat([]byte("w"), 128)))
+			}
+			require.NoError(t, tx.Rollback())
+
+			// The last committed state must be fully intact.
+			require.NoError(t, db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("widgets"))
+				require.Equal(t, []byte(bytes.Repeat([]byte("v"), 64)), b.Get([]byte("key-000")))
+				require.Nil(t, b.Get([]byte("new-000")))
+				return nil
+			}))
+
+			// The rolled-back pages must be reusable: write enough data to
+			// force the freelist to be consumed, then commit successfully.
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("widgets"))
+				for i := 0; i < 200; i++ {
+					require.NoError(t, b.Put([]byte(fmt.Sprintf("reuse-%03d", i)), bytes.Repeat([]byte("x"), 128)))
+				}
+				return nil
+			}))
+			db.MustCheck()
+
+			// Reopen and verify the freelist and committed data are consistent.
+			db.MustClose()
+			db.MustReopen()
+			db.MustCheck()
+			require.NoError(t, db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("widgets"))
+				require.Equal(t, []byte(bytes.Repeat([]byte("v"), 64)), b.Get([]byte("key-000")))
+				require.Equal(t, []byte(bytes.Repeat([]byte("x"), 128)), b.Get([]byte("reuse-000")))
+				require.Nil(t, b.Get([]byte("new-000")))
+				return nil
+			}))
+		})
+	}
+}
+
+// TestTx_CommitFailure_FreelistConsistency ensures that a commit which fails
+// while allocating or writing pages recovers through the same rollback path
+// as an explicit rollback: the freelist is restored, the last committed
+// state stays readable, and a reopen sees a consistent database.
+func TestTx_CommitFailure_FreelistConsistency(t *testing.T) {
+	for _, noFreelistSync := range []bool{false, true} {
+		t.Run(fmt.Sprintf("NoFreelistSync=%v", noFreelistSync), func(t *testing.T) {
+			db := btesting.MustCreateDBWithOption(t, &bolt.Options{
+				NoFreelistSync: noFreelistSync,
+				MaxSize:        256 * 1024,
+			})
+
+			// Seed some committed data.
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				b, err := tx.CreateBucket([]byte("widgets"))
+				require.NoError(t, err)
+				for i := 0; i < 50; i++ {
+					require.NoError(t, b.Put([]byte(fmt.Sprintf("key-%03d", i)), []byte("value")))
+				}
+				return nil
+			}))
+
+			// This transaction deletes (frees pages) and then fails to
+			// commit because the huge value exceeds MaxSize during
+			// allocation/spilling.
+			tx, err := db.Begin(true)
+			require.NoError(t, err)
+			b := tx.Bucket([]byte("widgets"))
+			require.NoError(t, b.Delete([]byte("key-000")))
+			require.NoError(t, b.Put([]byte("big"), make([]byte, 512*1024)))
+			require.Error(t, tx.Commit())
+
+			// The last committed state must still be served.
+			require.NoError(t, db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("widgets"))
+				require.Equal(t, []byte("value"), b.Get([]byte("key-000")))
+				require.Nil(t, b.Get([]byte("big")))
+				return nil
+			}))
+			db.MustCheck()
+
+			// The freelist must still be usable after the failed commit.
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				return tx.Bucket([]byte("widgets")).Put([]byte("after-failure"), []byte("ok"))
+			}))
+
+			// Reopen and verify consistency and committed data again.
+			db.MustClose()
+			db.MustReopen()
+			db.MustCheck()
+			require.NoError(t, db.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("widgets"))
+				require.Equal(t, []byte("value"), b.Get([]byte("key-000")))
+				require.Equal(t, []byte("ok"), b.Get([]byte("after-failure")))
+				require.Nil(t, b.Get([]byte("big")))
+				return nil
+			}))
+		})
+	}
+}
+
 // TestTx_releaseRange ensures db.freePages handles page releases
 // correctly when there are transaction that are no longer reachable
 // via any read/write transactions and are "between" ongoing read

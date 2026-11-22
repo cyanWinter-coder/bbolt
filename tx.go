@@ -220,6 +220,7 @@ func (tx *Tx) Commit() (err error) {
 		err = tx.commitFreelist()
 		if err != nil {
 			lg.Errorf("committing freelist failed: %v", err)
+			tx.rollback()
 			return err
 		}
 	} else {
@@ -229,9 +230,9 @@ func (tx *Tx) Commit() (err error) {
 	// If the high water mark has moved up then attempt to grow the database.
 	if tx.meta.Pgid() > opgid {
 		_ = errors.New("")
-		// gofail: var lackOfDiskSpace string
-		// tx.rollback()
-		// return errors.New(lackOfDiskSpace)
+		if vlackOfDiskSpace, __fpErr := __fp_lackOfDiskSpace.Acquire(); __fpErr == nil { lackOfDiskSpace, __fpTypeOK := vlackOfDiskSpace.(string); if !__fpTypeOK { goto __badTypelackOfDiskSpace} 
+			 tx.rollback()
+			 return errors.New(lackOfDiskSpace); goto __nomocklackOfDiskSpace; __badTypelackOfDiskSpace: __fp_lackOfDiskSpace.BadType(vlackOfDiskSpace, "string"); __nomocklackOfDiskSpace: };
 		if err = tx.db.grow(int(tx.meta.Pgid()+1) * tx.db.pageSize); err != nil {
 			lg.Errorf("growing db size failed, pgid: %d, pagesize: %d, error: %v", tx.meta.Pgid(), tx.db.pageSize, err)
 			tx.rollback()
@@ -285,9 +286,10 @@ func (tx *Tx) Commit() (err error) {
 func (tx *Tx) commitFreelist() error {
 	// Allocate new pages for the new free list. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
+	// The caller recovers a failure through the same tx.rollback path used
+	// by every other commit stage.
 	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
 	if err != nil {
-		tx.rollback()
 		return err
 	}
 
@@ -564,7 +566,7 @@ func (tx *Tx) write() error {
 
 	// Ignore file sync if flag is set on DB.
 	if !tx.db.NoSync || common.IgnoreNoSync {
-		// gofail: var beforeSyncDataPages struct{}
+		if vbeforeSyncDataPages, __fpErr := __fp_beforeSyncDataPages.Acquire(); __fpErr == nil { _, __fpTypeOK := vbeforeSyncDataPages.(struct{}); if !__fpTypeOK { goto __badTypebeforeSyncDataPages} ; goto __nomockbeforeSyncDataPages; __badTypebeforeSyncDataPages: __fp_beforeSyncDataPages.BadType(vbeforeSyncDataPages, "struct{}"); __nomockbeforeSyncDataPages: };
 		if err := fdatasync(tx.db); err != nil {
 			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %v", runtime.GOOS, runtime.GOARCH, err)
 			return err
@@ -593,8 +595,8 @@ func (tx *Tx) write() error {
 
 // writeMeta writes the meta to the disk.
 func (tx *Tx) writeMeta() error {
-	// gofail: var beforeWriteMetaError string
-	// return errors.New(beforeWriteMetaError)
+	if vbeforeWriteMetaError, __fpErr := __fp_beforeWriteMetaError.Acquire(); __fpErr == nil { beforeWriteMetaError, __fpTypeOK := vbeforeWriteMetaError.(string); if !__fpTypeOK { goto __badTypebeforeWriteMetaError} 
+		 return errors.New(beforeWriteMetaError); goto __nomockbeforeWriteMetaError; __badTypebeforeWriteMetaError: __fp_beforeWriteMetaError.BadType(vbeforeWriteMetaError, "string"); __nomockbeforeWriteMetaError: };
 
 	// Create a temporary buffer for the meta page.
 	lg := tx.db.Logger()
@@ -611,7 +613,7 @@ func (tx *Tx) writeMeta() error {
 	}
 	tx.db.metalock.Unlock()
 	if !tx.db.NoSync || common.IgnoreNoSync {
-		// gofail: var beforeSyncMetaPage struct{}
+		if vbeforeSyncMetaPage, __fpErr := __fp_beforeSyncMetaPage.Acquire(); __fpErr == nil { _, __fpTypeOK := vbeforeSyncMetaPage.(struct{}); if !__fpTypeOK { goto __badTypebeforeSyncMetaPage} ; goto __nomockbeforeSyncMetaPage; __badTypebeforeSyncMetaPage: __fp_beforeSyncMetaPage.BadType(vbeforeSyncMetaPage, "struct{}"); __nomockbeforeSyncMetaPage: };
 		if err := fdatasync(tx.db); err != nil {
 			lg.Errorf("[GOOS: %s, GOARCH: %s] fdatasync failed: %v", runtime.GOOS, runtime.GOARCH, err)
 			return err

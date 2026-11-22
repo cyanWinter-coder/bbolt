@@ -559,7 +559,7 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 		return errors.ErrIncompatibleValue
 	}
 
-	// gofail: var beforeBucketPut struct{}
+	if vbeforeBucketPut, __fpErr := __fp_beforeBucketPut.Acquire(); __fpErr == nil { _, __fpTypeOK := vbeforeBucketPut.(struct{}); if !__fpTypeOK { goto __badTypebeforeBucketPut} ; goto __nomockbeforeBucketPut; __badTypebeforeBucketPut: __fp_beforeBucketPut.BadType(vbeforeBucketPut, "struct{}"); __nomockbeforeBucketPut: };
 
 	c.node().put(newKey, newKey, value, 0, 0)
 

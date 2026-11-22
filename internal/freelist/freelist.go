@@ -52,7 +52,8 @@ type Interface interface {
 	// Freed returns whether a given page is in the free list.
 	Freed(pgId common.Pgid) bool
 
-	// Rollback removes the pages from a given pending tx.
+	// Rollback removes the pages from a given pending tx and returns the
+	// pages allocated by that tx back to the free set.
 	Rollback(txId common.Txid)
 
 	// Copyall copies a list of all free ids and all pending ids in one sorted list.

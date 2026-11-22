@@ -69,7 +69,7 @@ func (f *hashMap) Allocate(txid common.Txid, n int) common.Pgid {
 			// remove the span
 			f.delSpan(pid, uint64(n))
 
-			f.allocs[pid] = txid
+			f.allocs[pid] = allocInfo{txid: txid, n: uint64(n)}
 
 			for i := common.Pgid(0); i < common.Pgid(n); i++ {
 				delete(f.cache, pid+i)
@@ -88,7 +88,7 @@ func (f *hashMap) Allocate(txid common.Txid, n int) common.Pgid {
 			// remove the initial
 			f.delSpan(pid, size)
 
-			f.allocs[pid] = txid
+			f.allocs[pid] = allocInfo{txid: txid, n: uint64(n)}
 
 			remain := size - uint64(n)
 

@@ -447,6 +447,90 @@ func TestFreelist_E2E_RollbackPanics(t *testing.T) {
 	})
 }
 
+// Ensure that freeing a page which was allocated by the same transaction is
+// always rejected, regardless of the verification level.
+func TestFreelist_free_sameTransaction_panics(t *testing.T) {
+	f := newTestFreelist()
+	f.Init(common.Pgids{5, 6, 7})
+	require.Equal(t, common.Pgid(5), f.Allocate(common.Txid(100), 2))
+	require.Panics(t, func() {
+		f.Free(common.Txid(100), common.NewPage(5, common.LeafPageFlag, 0, 0))
+	})
+	// The failed free must not corrupt the freelist: the page is still
+	// owned by the allocating transaction and must not be reusable.
+	require.False(t, f.Freed(5))
+	requirePages(t, f, common.Pgids{7}, common.Pgids{})
+}
+
+// Ensure that rolling back a transaction returns both the pages it freed and
+// the pages it allocated, while pages owned by other transactions are left
+// untouched.
+func TestFreelist_E2E_RollbackReturnsAllocatedPages(t *testing.T) {
+	f := newTestFreelist()
+	f.Init(common.Pgids{3, 4, 5, 10, 11, 20})
+
+	// tx 100 frees a page which is still referenced by committed data.
+	f.Free(common.Txid(100), common.NewPage(30, common.LeafPageFlag, 0, 0))
+	// tx 101 allocates two spans and frees another committed page.
+	require.Equal(t, common.Pgid(3), f.Allocate(common.Txid(101), 3))
+	require.Equal(t, common.Pgid(10), f.Allocate(common.Txid(101), 2))
+	f.Free(common.Txid(101), common.NewPage(40, common.LeafPageFlag, 0, 1))
+	requirePages(t, f, common.Pgids{20}, common.Pgids{30, 40, 41})
+
+	f.Rollback(common.Txid(101))
+
+	// tx 100's pending page is untouched; tx 101's pending free is aborted
+	// and its allocated spans are returned to the free set.
+	requirePages(t, f, common.Pgids{3, 4, 5, 10, 11, 20}, common.Pgids{30})
+
+	// The returned pages can be allocated again by a later transaction.
+	require.Equal(t, common.Pgid(3), f.Allocate(common.Txid(102), 3))
+	require.Equal(t, common.Pgid(10), f.Allocate(common.Txid(102), 2))
+	requirePages(t, f, common.Pgids{20}, common.Pgids{30})
+}
+
+// Ensure that rolling back a transaction which only allocated pages (without
+// freeing anything) also returns those pages to the free set.
+func TestFreelist_E2E_RollbackAllocateOnly(t *testing.T) {
+	f := newTestFreelist()
+	f.Init(common.Pgids{5, 6, 7, 8})
+
+	require.Equal(t, common.Pgid(5), f.Allocate(common.Txid(7), 4))
+	requirePages(t, f, common.Pgids{}, common.Pgids{})
+
+	f.Rollback(common.Txid(7))
+	requirePages(t, f, common.Pgids{5, 6, 7, 8}, common.Pgids{})
+}
+
+// Ensure that pending pages are not released while a read-only transaction
+// which can still see them is open, and that they move to the free set once
+// the last such reader is gone.
+func TestFreelist_E2E_ReleasePendingPages_ReaderGating(t *testing.T) {
+	f := newTestFreelist()
+	f.Init(common.Pgids{})
+	f.Free(common.Txid(100), common.NewPage(10, common.LeafPageFlag, 0, 1))
+	f.Free(common.Txid(101), common.NewPage(20, common.LeafPageFlag, 0, 0))
+
+	// A reader on txid 100 still sees the pages freed by tx 100 and tx 101.
+	f.AddReadonlyTXID(common.Txid(100))
+	f.ReleasePendingPages()
+	requirePages(t, f, common.Pgids{}, common.Pgids{10, 11, 20})
+
+	// A second reader opens on txid 101 and the first one closes. The pages
+	// freed by tx 100 become reusable, but tx 101's pages are still visible
+	// to the remaining reader.
+	f.AddReadonlyTXID(common.Txid(101))
+	f.RemoveReadonlyTXID(common.Txid(100))
+	f.ReleasePendingPages()
+	requirePages(t, f, common.Pgids{10, 11}, common.Pgids{20})
+
+	// Once the last reader is gone, the remaining pending pages move to the
+	// free set.
+	f.RemoveReadonlyTXID(common.Txid(101))
+	f.ReleasePendingPages()
+	requirePages(t, f, common.Pgids{10, 11, 20}, common.Pgids{})
+}
+
 // tests the reloading from another physical page
 func TestFreelist_E2E_Reload(t *testing.T) {
 	freelist := newTestFreelist()

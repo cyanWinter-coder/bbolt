@@ -15,19 +15,27 @@ type txPending struct {
 	lastReleaseBegin common.Txid   // beginning txid of last matching releaseRange
 }
 
+// allocInfo describes a span of contiguous pages allocated by a transaction.
+// It allows a rollback to accurately return every page occupied by the
+// aborted transaction to the free set.
+type allocInfo struct {
+	txid common.Txid // transaction that allocated the span
+	n    uint64      // number of contiguous pages in the span
+}
+
 type shared struct {
 	Interface
 
-	readonlyTXIDs []common.Txid               // all readonly transaction IDs.
-	allocs        map[common.Pgid]common.Txid // mapping of Txid that allocated a pgid.
-	cache         map[common.Pgid]struct{}    // fast lookup of all free and pending page ids.
-	pending       map[common.Txid]*txPending  // mapping of soon-to-be free page ids by tx.
+	readonlyTXIDs []common.Txid              // all readonly transaction IDs.
+	allocs        map[common.Pgid]allocInfo  // mapping of allocation span start to its owner and size.
+	cache         map[common.Pgid]struct{}   // fast lookup of all free and pending page ids.
+	pending       map[common.Txid]*txPending // mapping of soon-to-be free page ids by tx.
 }
 
 func newShared() *shared {
 	return &shared{
 		pending: make(map[common.Txid]*txPending),
-		allocs:  make(map[common.Pgid]common.Txid),
+		allocs:  make(map[common.Pgid]allocInfo),
 		cache:   make(map[common.Pgid]struct{}),
 	}
 }
@@ -64,12 +72,14 @@ func (t *shared) Free(txid common.Txid, p *common.Page) {
 		txp = &txPending{}
 		t.pending[txid] = txp
 	}
-	allocTxid, ok := t.allocs[p.Id()]
-	common.Verify(func() {
-		if allocTxid == txid {
-			panic(fmt.Sprintf("free: freed page (%d) was allocated by the same transaction (%d)", p.Id(), txid))
-		}
-	})
+	alloc, ok := t.allocs[p.Id()]
+	allocTxid := alloc.txid
+	// A transaction must never free a page which was allocated by itself:
+	// the page is not referenced by any committed snapshot, so moving it to
+	// the pending set would make an uncommitted page reclaimable.
+	if ok && allocTxid == txid {
+		panic(fmt.Sprintf("free: freed page (%d) was allocated by the same transaction (%d)", p.Id(), txid))
+	}
 	if ok {
 		delete(t.allocs, p.Id())
 	}
@@ -87,32 +97,49 @@ func (t *shared) Free(txid common.Txid, p *common.Page) {
 }
 
 func (t *shared) Rollback(txid common.Txid) {
-	// Remove page ids from cache.
+	// Abort the pending frees owned by this transaction. Only pages recorded
+	// under this txid are touched; pages pending for other transactions are
+	// left alone.
 	txp := t.pending[txid]
-	if txp == nil {
-		return
+	if txp != nil {
+		for i, pgid := range txp.ids {
+			delete(t.cache, pgid)
+			tx := txp.alloctx[i]
+			if tx == 0 {
+				continue
+			}
+			if tx != txid {
+				// Pending free aborted; restore page back to alloc list.
+				t.allocs[pgid] = allocInfo{txid: tx, n: 1}
+			} else {
+				// A writing TXN should never free a page which was allocated by itself.
+				panic(fmt.Sprintf("rollback: freed page (%d) was allocated by the same transaction (%d)", pgid, txid))
+			}
+		}
+		// Remove pages from pending list and mark as free if allocated by txid.
+		delete(t.pending, txid)
 	}
-	for i, pgid := range txp.ids {
-		delete(t.cache, pgid)
-		tx := txp.alloctx[i]
-		if tx == 0 {
+
+	// Return the pages allocated by this transaction to the free set. The
+	// transaction never committed, so no committed snapshot can reference
+	// them; keeping them out of the free set would leak them until the next
+	// freelist reload.
+	var ids common.Pgids
+	for pgid, alloc := range t.allocs {
+		if alloc.txid != txid {
 			continue
 		}
-		if tx != txid {
-			// Pending free aborted; restore page back to alloc list.
-			t.allocs[pgid] = tx
-		} else {
-			// A writing TXN should never free a page which was allocated by itself.
-			panic(fmt.Sprintf("rollback: freed page (%d) was allocated by the same transaction (%d)", pgid, txid))
+		for i := uint64(0); i < alloc.n; i++ {
+			ids = append(ids, pgid+common.Pgid(i))
 		}
+		delete(t.allocs, pgid)
 	}
-	// Remove pages from pending list and mark as free if allocated by txid.
-	delete(t.pending, txid)
-
-	// Remove pgids which are allocated by this txid
-	for pgid, tid := range t.allocs {
-		if tid == txid {
-			delete(t.allocs, pgid)
+	if len(ids) > 0 {
+		t.mergeSpans(ids)
+		// The pages were removed from the cache when allocated; put them
+		// back now that they are free again.
+		for _, id := range ids {
+			t.cache[id] = struct{}{}
 		}
 	}
 }

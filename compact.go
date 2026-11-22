@@ -1,11 +1,23 @@
 package bbolt
 
+import "context"
+
 // Compact will create a copy of the source DB and in the destination DB. This may
 // reclaim space that the source database no longer has use for. txMaxSize can be
 // used to limit the transactions size of this process and may trigger intermittent
 // commits. A value of zero will ignore transaction sizes.
 // TODO: merge with: https://github.com/etcd-io/etcd/blob/b7f0f52a16dbf83f18ca1d803f7892d750366a94/mvcc/backend/backend.go#L349
 func Compact(dst, src *DB, txMaxSize int64) error {
+	return src.View(func(tx *Tx) error {
+		return compact(dst, tx, txMaxSize, nil, nil)
+	})
+}
+
+// compact copies everything visible in the read transaction srcTx into dst,
+// committing in batches bounded by txMaxSize (a value of zero disables batching).
+// If ctx is non-nil, cancellation aborts the copy. If info is non-nil, the
+// number of copied buckets and key/value pairs is accumulated into it.
+func compact(dst *DB, srcTx *Tx, txMaxSize int64, ctx context.Context, info *SnapshotInfo) error {
 	// commit regularly, or we'll run out of memory for large datasets if using one transaction.
 	var size int64
 	tx, err := dst.Begin(true)
@@ -18,7 +30,15 @@ func Compact(dst, src *DB, txMaxSize int64) error {
 		}
 	}()
 
-	if err := walk(src, func(keys [][]byte, k, v []byte, seq uint64) error {
+	if err := walkTx(srcTx, func(keys [][]byte, k, v []byte, seq uint64) error {
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// On each key/value, check if we have exceeded tx size.
 		sz := int64(len(k) + len(v))
 		if size+sz > txMaxSize && txMaxSize != 0 {
@@ -46,6 +66,9 @@ func Compact(dst, src *DB, txMaxSize int64) error {
 			if err := bkt.SetSequence(seq); err != nil {
 				return err
 			}
+			if info != nil {
+				info.BucketCount++
+			}
 			return nil
 		}
 
@@ -69,10 +92,16 @@ func Compact(dst, src *DB, txMaxSize int64) error {
 			if err := bkt.SetSequence(seq); err != nil {
 				return err
 			}
+			if info != nil {
+				info.BucketCount++
+			}
 			return nil
 		}
 
 		// Otherwise treat it as a key/value pair.
+		if info != nil {
+			info.KeyCount++
+		}
 		return b.Put(k, v)
 	}); err != nil {
 		return err
@@ -90,9 +119,15 @@ type walkFunc func(keys [][]byte, k, v []byte, seq uint64) error
 // walk walks recursively the bolt database db, calling walkFn for each key it finds.
 func walk(db *DB, walkFn walkFunc) error {
 	return db.View(func(tx *Tx) error {
-		return tx.ForEach(func(name []byte, b *Bucket) error {
-			return walkBucket(b, nil, name, nil, b.Sequence(), walkFn)
-		})
+		return walkTx(tx, walkFn)
+	})
+}
+
+// walkTx walks recursively the database as seen by the read transaction tx,
+// calling walkFn for each key it finds.
+func walkTx(tx *Tx, walkFn walkFunc) error {
+	return tx.ForEach(func(name []byte, b *Bucket) error {
+		return walkBucket(b, nil, name, nil, b.Sequence(), walkFn)
 	})
 }
 

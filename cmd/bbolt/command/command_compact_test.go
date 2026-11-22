@@ -95,6 +95,40 @@ func TestCompactCommand_Run(t *testing.T) {
 	require.Equal(t, dbChk, dstdbChk, "the compacted db data isn't the same than the original db")
 }
 
+func TestCompactCommand_Snapshot(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+	err := db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucket([]byte("widgets"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 100; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("key-%03d", i)), []byte(fmt.Sprintf("value-%03d", i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	dstPath := filepath.Join(t.TempDir(), "dst.db")
+	rootCmd := command.NewRootCommand()
+	rootCmd.SetArgs([]string{"compact", "--snapshot", "-o", dstPath, db.Path()})
+	require.NoError(t, rootCmd.Execute())
+
+	// the published snapshot must be a valid database holding the same data.
+	srcChk, err := chkdb(db.Path())
+	require.NoError(t, err)
+	dstChk, err := chkdb(dstPath)
+	require.NoError(t, err)
+	require.Equal(t, srcChk, dstChk, "the snapshot data isn't the same as the source db")
+
+	// no temporary file may be left behind.
+	_, err = os.Stat(dstPath + ".tmp")
+	require.True(t, os.IsNotExist(err))
+}
+
 func TestCompactCommand_NoArgs(t *testing.T) {
 	expErr := errors.New("requires at least 1 arg(s), only received 0")
 	rootCmd := command.NewRootCommand()

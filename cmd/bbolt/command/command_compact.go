@@ -15,6 +15,7 @@ type compactOptions struct {
 	dstPath   string
 	txMaxSize int64
 	dstNoSync bool
+	snapshot  bool
 }
 
 func newCompactCommand() *cobra.Command {
@@ -42,6 +43,7 @@ func (o *compactOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&o.dstPath, "output", "o", "", "")
 	fs.Int64Var(&o.txMaxSize, "tx-max-size", 65536, "")
 	fs.BoolVar(&o.dstNoSync, "no-sync", false, "")
+	fs.BoolVar(&o.snapshot, "snapshot", false, "build the compacted copy in a temporary file and atomically publish it only after it is fully written and validated")
 	_ = cobra.MarkFlagRequired(fs, "output")
 }
 
@@ -71,6 +73,21 @@ func (o *compactOptions) Run(cmd *cobra.Command, srcPath string) (err error) {
 		return err
 	}
 	defer src.Close()
+
+	if o.snapshot {
+		// build the copy in a temporary file and atomically publish it only
+		// once it has been fully written and validated.
+		info, err := bolt.CompactSnapshot(cmd.Context(), src, o.dstPath, &bolt.SnapshotCompactOptions{
+			TxMaxSize: o.txMaxSize,
+			NoSync:    o.dstNoSync,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%d -> %d bytes (gain=%.2fx, source-txid=%d, buckets=%d, keys=%d)\n",
+			initialSize, info.Size, float64(initialSize)/float64(info.Size), info.SourceTxID, info.BucketCount, info.KeyCount)
+		return nil
+	}
 
 	// open destination database.
 	dst, err := bolt.Open(o.dstPath, fi.Mode(), &bolt.Options{NoSync: o.dstNoSync})

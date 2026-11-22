@@ -490,6 +490,7 @@ Flags:
   -h, --help              help for compact
       --no-sync
   -o, --output string
+      --snapshot          build the compacted copy in a temporary file and atomically publish it only after it is fully written and validated
       --tx-max-size int   (default 65536)
 ```
 
@@ -501,6 +502,13 @@ Example:
   ```
 
   - It will create a compacted database file: `db.compact` at given path.
+
+With `--snapshot`, the compacted copy is first written to a temporary file next to the destination, validated (meta checksums and bucket structure), and only then atomically renamed over the destination. Readers of the destination path therefore only ever see the previous complete file or the new complete file, never a partially written one; if the command is interrupted, the temporary file is removed and any pre-existing destination file is left untouched.
+
+  ```bash
+  $bbolt compact --snapshot -o ~/db.compact ~/default.etcd/member/snap/db
+  16805888 -> 32768 bytes (gain=512.88x, source-txid=1234, buckets=5, keys=6789)
+  ```
 
 ### bench
 

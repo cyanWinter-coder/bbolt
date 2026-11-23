@@ -3,7 +3,9 @@ package failpoint
 import (
 	crand "crypto/rand"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -157,6 +159,106 @@ func TestFailpoint_LackOfDiskSpace(t *testing.T) {
 	err = tx.Rollback()
 	require.Error(t, err)
 	require.ErrorIs(t, err, errors.ErrTxClosed)
+}
+
+// ensures when the remap fails during growth, the old mapping generation
+// stays installed and the database keeps working without a reopen.
+func TestFailpoint_MapFail_When_remap(t *testing.T) {
+	db := btesting.MustCreateDB(t)
+
+	// Write some initial data before enabling the failpoint.
+	err := db.Fill([]byte("data"), 1, 1000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.NoError(t, err)
+
+	err = gofail.Enable("mapError", `return("map somehow failed in allocate")`)
+	require.NoError(t, err)
+
+	// The remap triggered by the growth fails; the failure must not destroy
+	// the currently installed mapping generation.
+	err = db.Fill([]byte("data"), 1, 10000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "map somehow failed in allocate")
+
+	// It should work after disabling the failpoint, without reopening the
+	// database: the old generation was never torn down.
+	err = gofail.Disable("mapError")
+	require.NoError(t, err)
+
+	err = db.Fill([]byte("data"), 1, 20000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.NoError(t, err)
+
+	db.MustClose()
+	db.MustReopen()
+
+	// All data written before and after the failed remap is readable.
+	err = db.Fill([]byte("data"), 1, 30000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.NoError(t, err)
+}
+
+// ensures when syncing the resized data file fails during growth, the file
+// range is rolled back and a retry with the same target size succeeds.
+func TestFailpoint_SyncFileFail_GrowRollback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows doesn't grow the file inside grow; nothing to roll back.
+		t.SkipNow()
+	}
+
+	db := btesting.MustCreateDB(t)
+
+	err := db.Fill([]byte("data"), 1, 1000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.NoError(t, err)
+
+	sizeBefore := fileSize(t, db.Path())
+
+	err = gofail.Enable("syncFileError", `return("sync somehow failed")`)
+	require.NoError(t, err)
+
+	err = db.Fill([]byte("data"), 1, 10000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "sync somehow failed")
+
+	// The file range must have been restored to the pre-grow size.
+	require.Equal(t, sizeBefore, fileSize(t, db.Path()),
+		"file size must be rolled back after a failed grow")
+
+	// It should work after disabling the failpoint; the retry grows the
+	// file exactly once.
+	err = gofail.Disable("syncFileError")
+	require.NoError(t, err)
+
+	err = db.Fill([]byte("data"), 1, 10000,
+		func(tx int, k int) []byte { return []byte(fmt.Sprintf("%04d", k)) },
+		func(tx int, k int) []byte { return make([]byte, 100) },
+	)
+	require.NoError(t, err)
+
+	db.MustClose()
+	db.MustReopen()
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	return fi.Size()
 }
 
 // TestIssue72 reproduces issue 72.

@@ -51,39 +51,44 @@ func funlock(db *DB) error {
 	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
 }
 
-// mmap memory maps a DB's data file.
-func mmap(db *DB, sz int) error {
+// mmap memory maps a DB's data file and returns the new mapping generation.
+// The generation currently installed on the DB is left untouched, so a
+// failure doesn't affect the existing mapping.
+func mmap(db *DB, sz int) (*dbMapping, error) {
 	// Map the data file to memory.
 	b, err := unix.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Advise the kernel that the mmap is accessed randomly.
 	err = unix.Madvise(b, syscall.MADV_RANDOM)
 	if err != nil && err != syscall.ENOSYS {
 		// Ignore not implemented error in kernel because it still works.
-		return fmt.Errorf("madvise: %s", err)
+		// Unmap the fresh mapping to avoid leaking it.
+		_ = unix.Munmap(b)
+		return nil, fmt.Errorf("madvise: %s", err)
 	}
 
 	// Save the original byte slice and convert to a byte array pointer.
-	db.dataref = b
-	db.data = (*[common.MaxMapSize]byte)(unsafe.Pointer(&b[0]))
-	db.datasz = sz
-	return nil
+	return &dbMapping{
+		dataref: b,
+		data:    (*[common.MaxMapSize]byte)(unsafe.Pointer(&b[0])),
+		datasz:  sz,
+	}, nil
 }
 
-// munmap unmaps a DB's data file from memory.
-func munmap(db *DB) error {
+// munmap unmaps a mapping generation from memory.
+func (m *dbMapping) munmap() error {
 	// Ignore the unmap if we have no mapped data.
-	if db.dataref == nil {
+	if m == nil || m.dataref == nil {
 		return nil
 	}
 
 	// Unmap using the original byte slice.
-	err := unix.Munmap(db.dataref)
-	db.dataref = nil
-	db.data = nil
-	db.datasz = 0
+	err := unix.Munmap(m.dataref)
+	m.dataref = nil
+	m.data = nil
+	m.datasz = 0
 	return err
 }

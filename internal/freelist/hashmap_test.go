@@ -173,7 +173,10 @@ func Test_Freelist_Hashmap_Rollback(t *testing.T) {
 	f.Free(100, common.NewPage(25, 0, 0, 0))
 	f.Allocate(100, 2)
 
-	require.Equal(t, map[common.Pgid]common.Txid{5: 100, 12: 100}, f.allocs)
+	require.Equal(t, map[common.Pgid]*allocEntry{
+		5:  {txid: 100, size: 3},
+		12: {txid: 100, size: 2},
+	}, f.allocs)
 	require.Equal(t, map[common.Txid]*txPending{100: {
 		ids:     []common.Pgid{20, 21, 25},
 		alloctx: []common.Txid{0, 0, 0},
@@ -181,8 +184,13 @@ func Test_Freelist_Hashmap_Rollback(t *testing.T) {
 
 	f.Rollback(100)
 
-	require.Equal(t, map[common.Pgid]common.Txid{}, f.allocs)
+	require.Equal(t, map[common.Pgid]*allocEntry{}, f.allocs)
 	require.Equal(t, map[common.Txid]*txPending{}, f.pending)
+
+	// The rolled back allocations must be returned to the free set and
+	// merged back into their original spans.
+	require.Equal(t, common.Pgids{3, 5, 6, 7, 12, 13}, f.freePageIds())
+	require.Equal(t, 0, int(f.ReuseCount()))
 }
 
 func Benchmark_freelist_hashmapGetFreePageIDs(b *testing.B) {

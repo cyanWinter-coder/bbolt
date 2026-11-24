@@ -27,6 +27,23 @@ type Interface interface {
 	// available; otherwise, it returns 0.
 	Allocate(txid common.Txid, numPages int) common.Pgid
 
+	// ReuseCount returns how many times pages were reused from the free
+	// list (a successful Allocate) instead of being appended to the file.
+	// The counter is in-memory only and resets to zero on every Open.
+	ReuseCount() uint64
+
+	// Compact re-indexes the free pages and merges adjacent free spans.
+	// It is a no-op when the free list fragmentation does not exceed the
+	// given thresholds. It returns true when a compaction was performed.
+	//
+	//   - fragmentRatio is the maximum ratio of single-page spans over all
+	//     free spans that is tolerated without triggering a compaction, in
+	//     the range (0.0, 1.0].
+	//   - minFreePages is the minimum number of free pages required for a
+	//     compaction to be considered; tiny free lists are not worth the
+	//     rebuild cost.
+	Compact(fragmentRatio float64, minFreePages int) bool
+
 	// Count returns the number of free and pending pages.
 	Count() int
 
@@ -67,6 +84,14 @@ type Interface interface {
 
 	// freePageIds returns the IDs of all free pages. Returns an empty slice if no free pages are available.
 	freePageIds() common.Pgids
+
+	// freeSpanCount returns the number of maximal contiguous spans in the
+	// free page set.
+	freeSpanCount() int
+
+	// multiPageSpanCount returns the number of free spans containing more
+	// than one page.
+	multiPageSpanCount() int
 
 	// pendingPageIds returns all pending pages by transaction id.
 	pendingPageIds() map[common.Txid]*txPending

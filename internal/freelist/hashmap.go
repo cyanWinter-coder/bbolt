@@ -63,13 +63,21 @@ func (f *hashMap) Allocate(txid common.Txid, n int) common.Pgid {
 		return 0
 	}
 
-	// if we have a exact size match just return short path
+	// Exact size match short path. Iterate the bucket deterministically so
+	// ties resolve to the lowest starting page id instead of relying on map
+	// iteration order.
 	if bm, ok := f.freemaps[uint64(n)]; ok {
-		for pid := range bm {
+		var pid common.Pgid
+		for candidate := range bm {
+			if pid == 0 || candidate < pid {
+				pid = candidate
+			}
+		}
+		if pid != 0 {
 			// remove the span
 			f.delSpan(pid, uint64(n))
 
-			f.allocs[pid] = txid
+			f.recordAlloc(txid, pid, uint64(n))
 
 			for i := common.Pgid(0); i < common.Pgid(n); i++ {
 				delete(f.cache, pid+i)
@@ -78,31 +86,59 @@ func (f *hashMap) Allocate(txid common.Txid, n int) common.Pgid {
 		}
 	}
 
-	// lookup the map to find larger span
+	// Find the smallest span which is still large enough (best-fit) and,
+	// among spans of the same size, pick the lowest starting page id. This
+	// replaces the previous random map iteration so allocation order is
+	// deterministic and fragmentation is minimized.
+	bestSize := uint64(0)
+	bestPid := common.Pgid(0)
 	for size, bm := range f.freemaps {
 		if size < uint64(n) {
 			continue
 		}
-
 		for pid := range bm {
-			// remove the initial
-			f.delSpan(pid, size)
-
-			f.allocs[pid] = txid
-
-			remain := size - uint64(n)
-
-			// add remain span
-			f.addSpan(pid+common.Pgid(n), remain)
-
-			for i := common.Pgid(0); i < common.Pgid(n); i++ {
-				delete(f.cache, pid+i)
+			if bestPid == 0 || size < bestSize || (size == bestSize && pid < bestPid) {
+				bestSize = size
+				bestPid = pid
 			}
-			return pid
 		}
 	}
+	if bestPid == 0 {
+		return 0
+	}
 
-	return 0
+	// remove the initial
+	f.delSpan(bestPid, bestSize)
+
+	f.recordAlloc(txid, bestPid, uint64(n))
+
+	remain := bestSize - uint64(n)
+
+	// add remain span
+	if remain > 0 {
+		f.addSpan(bestPid+common.Pgid(n), remain)
+	}
+
+	for i := common.Pgid(0); i < common.Pgid(n); i++ {
+		delete(f.cache, bestPid+i)
+	}
+	return bestPid
+}
+
+// freeSpanCount returns the number of maximal contiguous free spans.
+func (f *hashMap) freeSpanCount() int {
+	return len(f.forwardMap)
+}
+
+// multiPageSpanCount returns the number of free spans holding > 1 page.
+func (f *hashMap) multiPageSpanCount() int {
+	count := 0
+	for _, size := range f.forwardMap {
+		if size > 1 {
+			count++
+		}
+	}
+	return count
 }
 
 func (f *hashMap) FreeCount() int {

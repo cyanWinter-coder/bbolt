@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync/atomic"
 	"unsafe"
 
 	"go.etcd.io/bbolt/internal/common"
@@ -15,19 +16,33 @@ type txPending struct {
 	lastReleaseBegin common.Txid   // beginning txid of last matching releaseRange
 }
 
+// allocEntry records a contiguous span of pages handed out by Allocate.
+// size is always >= 1; the span covers [start, start+size).
+type allocEntry struct {
+	txid common.Txid // transaction the span was allocated to
+	size uint64      // number of pages in the span
+}
+
+// pgidSpan is a contiguous range of free pages [start, start+size).
+type pgidSpan struct {
+	start common.Pgid
+	size  uint64
+}
+
 type shared struct {
 	Interface
 
 	readonlyTXIDs []common.Txid               // all readonly transaction IDs.
-	allocs        map[common.Pgid]common.Txid // mapping of Txid that allocated a pgid.
+	allocs        map[common.Pgid]*allocEntry // mapping of spans allocated out of the free list by starting pgid.
 	cache         map[common.Pgid]struct{}    // fast lookup of all free and pending page ids.
 	pending       map[common.Txid]*txPending  // mapping of soon-to-be free page ids by tx.
+	reuseCount    atomic.Uint64               // number of successful allocations served from the free list.
 }
 
 func newShared() *shared {
 	return &shared{
 		pending: make(map[common.Txid]*txPending),
-		allocs:  make(map[common.Pgid]common.Txid),
+		allocs:  make(map[common.Pgid]*allocEntry),
 		cache:   make(map[common.Pgid]struct{}),
 	}
 }
@@ -64,7 +79,11 @@ func (t *shared) Free(txid common.Txid, p *common.Page) {
 		txp = &txPending{}
 		t.pending[txid] = txp
 	}
-	allocTxid, ok := t.allocs[p.Id()]
+	allocEntry, ok := t.allocs[p.Id()]
+	var allocTxid common.Txid
+	if ok {
+		allocTxid = allocEntry.txid
+	}
 	common.Verify(func() {
 		if allocTxid == txid {
 			panic(fmt.Sprintf("free: freed page (%d) was allocated by the same transaction (%d)", p.Id(), txid))
@@ -86,35 +105,150 @@ func (t *shared) Free(txid common.Txid, p *common.Page) {
 	}
 }
 
-func (t *shared) Rollback(txid common.Txid) {
-	// Remove page ids from cache.
-	txp := t.pending[txid]
-	if txp == nil {
-		return
+// recordAlloc stores an allocation served from the free list so that it can
+// be restored if the allocating transaction rolls back.
+func (t *shared) recordAlloc(txid common.Txid, start common.Pgid, size uint64) {
+	t.allocs[start] = &allocEntry{txid: txid, size: size}
+	t.reuseCount.Add(1)
+}
+
+// ReuseCount returns the number of allocations served from the free list
+// since the free list was created.
+func (t *shared) ReuseCount() uint64 {
+	return t.reuseCount.Load()
+}
+
+// Compact rebuilds the free page set so that adjacent pages form single
+// maximal spans. It only performs the rebuild when the fraction of
+// single-page spans reaches fragmentRatio and the free list holds at least
+// minFreePages pages.
+func (t *shared) Compact(fragmentRatio float64, minFreePages int) bool {
+	if fragmentRatio <= 0 || fragmentRatio > 1 {
+		panic(fmt.Sprintf("fragmentRatio must be in (0.0, 1.0], got %v", fragmentRatio))
 	}
-	for i, pgid := range txp.ids {
-		delete(t.cache, pgid)
-		tx := txp.alloctx[i]
-		if tx == 0 {
+	if minFreePages <= 0 {
+		panic(fmt.Sprintf("minFreePages must be positive, got %d", minFreePages))
+	}
+
+	freeCount := t.FreeCount()
+	if freeCount < minFreePages {
+		return false
+	}
+
+	spanCount := t.freeSpanCount()
+	if spanCount == 0 {
+		return false
+	}
+	// The worst possible fragmentation is one page per span.
+	singlePageSpans := spanCount - t.multiPageSpanCount()
+	if float64(singlePageSpans)/float64(spanCount) < fragmentRatio {
+		return false
+	}
+
+	// Rebuild from the authoritative page id list. Init collapses adjacent
+	// ids into single spans, which also keeps all lookup structures in sync.
+	t.Init(t.freePageIds())
+	return true
+}
+
+func (t *shared) Rollback(txid common.Txid) {
+	// orphaned collects pending pages whose allocating transaction no longer
+	// exists (it already rolled back); they must return to the free set.
+	var orphaned []common.Pgid
+
+	// Remove page ids from cache.
+	if txp := t.pending[txid]; txp != nil {
+		for i, pgid := range txp.ids {
+			delete(t.cache, pgid)
+			tx := txp.alloctx[i]
+			if tx == 0 {
+				// The page was never allocated through the free list (e.g. a
+				// page freshly appended to the file), so there is no span to
+				// restore. Skip it.
+				continue
+			}
+			if tx != txid {
+				if _, stillTracked := t.allocs[pgid]; stillTracked {
+					// Pending free aborted; restore page back to alloc list.
+					// The span size is unknown here because the pending list
+					// only tracks individual page ids; record a single-page
+					// entry, which is sufficient for subsequent Free/Rollback
+					// bookkeeping.
+					t.allocs[pgid] = &allocEntry{txid: tx, size: 1}
+				} else {
+					// The allocating transaction already rolled back and
+					// dropped its span tracking, so nobody owns this page
+					// anymore; it is free once this pending free is undone.
+					orphaned = append(orphaned, pgid)
+				}
+			} else {
+				// A writing TXN should never free a page which was allocated by itself.
+				panic(fmt.Sprintf("rollback: freed page (%d) was allocated by the same transaction (%d)", pgid, txid))
+			}
+		}
+		// Remove pages from pending list.
+		delete(t.pending, txid)
+	}
+
+	// Restore the spans allocated by this transaction back into the free set.
+	// Pages which were allocated by the same transaction must not remain in
+	// the cache while they are re-added, so detach them first and let
+	// mergeSpans re-insert them together with their neighbours.
+	rolledBack := make([]pgidSpan, 0)
+	for start, entry := range t.allocs {
+		if entry.txid != txid {
 			continue
 		}
-		if tx != txid {
-			// Pending free aborted; restore page back to alloc list.
-			t.allocs[pgid] = tx
-		} else {
-			// A writing TXN should never free a page which was allocated by itself.
-			panic(fmt.Sprintf("rollback: freed page (%d) was allocated by the same transaction (%d)", pgid, txid))
+		rolledBack = append(rolledBack, pgidSpan{start: start, size: entry.size})
+		// The allocation is undone, so its reuse no longer counts.
+		t.reuseCount.Add(^uint64(0))
+		for i := common.Pgid(0); i < common.Pgid(entry.size); i++ {
+			delete(t.cache, start+i)
 		}
 	}
-	// Remove pages from pending list and mark as free if allocated by txid.
-	delete(t.pending, txid)
+	// Build a lookup of every page currently held in a pending free list so
+	// the span restoration below can skip pages another transaction still
+	// references.
+	pendingLookup := t.pendingPgidSet()
+	for _, span := range rolledBack {
+		delete(t.allocs, span.start)
+		ids := make([]common.Pgid, 0, span.size)
+		for i := common.Pgid(0); i < common.Pgid(span.size); i++ {
+			pgid := span.start + i
+			// Another transaction may already be holding this page in its
+			// pending free list. Such a page must not re-enter the free set
+			// while it is still pending; it stays in the cache via reindex.
+			if _, ok := pendingLookup[pgid]; ok {
+				continue
+			}
+			ids = append(ids, pgid)
+		}
+		if len(ids) > 0 {
+			t.mergeSpans(ids)
+		}
+	}
 
-	// Remove pgids which are allocated by this txid
-	for pgid, tid := range t.allocs {
-		if tid == txid {
-			delete(t.allocs, pgid)
+	// Return pending pages whose allocating transaction has already gone.
+	if len(orphaned) > 0 {
+		t.mergeSpans(orphaned)
+	}
+
+	// Rebuild the lookup cache: the restored pages were detached from the
+	// cache while allocated, and mergeSpans only updates the backend's span
+	// structures, not the shared cache.
+	t.reindex()
+}
+
+// pendingPgidSet returns a lookup set of every page currently in a
+// transaction's pending free list.
+func (t *shared) pendingPgidSet() map[common.Pgid]struct{} {
+	pendingLookup := make(map[common.Pgid]struct{})
+	for _, txp := range t.pending {
+		for _, id := range txp.ids {
+			pendingLookup[id] = struct{}{}
 		}
 	}
+	return pendingLookup
 }
 
 func (t *shared) AddReadonlyTXID(tid common.Txid) {

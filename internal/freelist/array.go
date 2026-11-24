@@ -19,7 +19,7 @@ func (f *array) Init(ids common.Pgids) {
 }
 
 func (f *array) Allocate(txid common.Txid, n int) common.Pgid {
-	if len(f.ids) == 0 {
+	if n == 0 || len(f.ids) == 0 {
 		return 0
 	}
 
@@ -48,10 +48,10 @@ func (f *array) Allocate(txid common.Txid, n int) common.Pgid {
 			}
 
 			// Remove from the free cache.
-			for i := common.Pgid(0); i < common.Pgid(n); i++ {
-				delete(f.cache, initial+i)
+			for k := common.Pgid(0); k < common.Pgid(n); k++ {
+				delete(f.cache, initial+k)
 			}
-			f.allocs[initial] = txid
+			f.recordAlloc(txid, initial, uint64(n))
 			return initial
 		}
 
@@ -66,6 +66,37 @@ func (f *array) FreeCount() int {
 
 func (f *array) freePageIds() common.Pgids {
 	return f.ids
+}
+
+// freeSpanCount returns the number of maximal contiguous free spans.
+func (f *array) freeSpanCount() int {
+	count := 0
+	for i := range f.ids {
+		if i == 0 || f.ids[i] != f.ids[i-1]+1 {
+			count++
+		}
+	}
+	return count
+}
+
+// multiPageSpanCount returns the number of free spans holding > 1 page.
+func (f *array) multiPageSpanCount() int {
+	count := 0
+	spanLen := 0
+	for i := range f.ids {
+		if i == 0 || f.ids[i] != f.ids[i-1]+1 {
+			if spanLen > 1 {
+				count++
+			}
+			spanLen = 1
+		} else {
+			spanLen++
+		}
+	}
+	if spanLen > 1 {
+		count++
+	}
+	return count
 }
 
 func (f *array) mergeSpans(ids common.Pgids) {

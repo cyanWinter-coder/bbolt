@@ -18,6 +18,14 @@ import (
 // The time elapsed between consecutive file locking attempts.
 const flockRetryTimeout = 50 * time.Millisecond
 
+// Free list compaction thresholds. A compaction is triggered at the start of
+// a read/write transaction when at least freelistCompactMinPages free pages
+// exist and the share of single-page spans reaches freelistCompactRatio.
+const (
+	freelistCompactRatio    = 0.5
+	freelistCompactMinPages = 1000
+)
+
 // FreelistType is the type of the freelist backend
 type FreelistType string
 
@@ -431,6 +439,7 @@ func (db *DB) loadFreelist() {
 		}
 		if db.stats != nil {
 			db.stats.FreePageN = db.freelist.FreeCount()
+			db.stats.ReusePageN = db.freelist.ReuseCount()
 		}
 	})
 }
@@ -868,6 +877,10 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	t.init(db)
 	db.rwtx = t
 	db.freelist.ReleasePendingPages()
+	// Re-index the free list when fragmented spans would otherwise make the
+	// best-fit allocator split larger spans over and over. The call is a
+	// no-op below the fragmentation thresholds.
+	db.freelist.Compact(freelistCompactRatio, freelistCompactMinPages)
 	return t, nil
 }
 
@@ -1112,9 +1125,29 @@ func (db *DB) Sync() (err error) {
 func (db *DB) Stats() Stats {
 	var s Stats
 	if db.stats != nil {
-		db.statlock.RLock()
+		db.statlock.Lock()
 		s = *db.stats
-		db.statlock.RUnlock()
+		db.statlock.Unlock()
+
+		// Refresh the freelist counters from the live free list so the
+		// reported numbers always match the pages which can actually be
+		// allocated, even when no write transaction has closed since the
+		// last change (e.g. after read-only transactions release pages).
+		if db.freelist != nil {
+			db.metalock.Lock()
+			freeN := db.freelist.FreeCount()
+			pendingN := db.freelist.PendingCount()
+			reuse := db.freelist.ReuseCount()
+			db.metalock.Unlock()
+
+			db.statlock.Lock()
+			db.stats.FreePageN = freeN
+			db.stats.PendingPageN = pendingN
+			db.stats.ReusePageN = reuse
+			db.stats.FreeAlloc = (freeN + pendingN) * db.pageSize
+			s = *db.stats
+			db.statlock.Unlock()
+		}
 	}
 	return s
 }
@@ -1422,10 +1455,11 @@ type Stats struct {
 	TxStats TxStats // global, ongoing stats.
 
 	// Freelist stats
-	FreePageN     int // total number of free pages on the freelist
-	PendingPageN  int // total number of pending pages on the freelist
-	FreeAlloc     int // total bytes allocated in free pages
-	FreelistInuse int // total bytes used by the freelist
+	FreePageN     int    // total number of free pages on the freelist
+	PendingPageN  int    // total number of pending pages on the freelist
+	FreeAlloc     int    // total bytes allocated in free pages
+	FreelistInuse int    // total bytes used by the freelist
+	ReusePageN    uint64 // total number of pages handed out from the freelist since the DB was opened (in-memory counter, resets on reopen)
 
 	// Transaction stats
 	TxN     int // total number of started read transactions
@@ -1444,6 +1478,7 @@ func (s *Stats) Sub(other *Stats) Stats {
 	diff.PendingPageN = s.PendingPageN
 	diff.FreeAlloc = s.FreeAlloc
 	diff.FreelistInuse = s.FreelistInuse
+	diff.ReusePageN = s.ReusePageN
 	diff.TxN = s.TxN - other.TxN
 	diff.TxStats = s.TxStats.Sub(&other.TxStats)
 	return diff

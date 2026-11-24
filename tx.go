@@ -351,6 +351,9 @@ func (tx *Tx) close() {
 		var freelistFreeN = tx.db.freelist.FreeCount()
 		var freelistPendingN = tx.db.freelist.PendingCount()
 		var freelistAlloc = tx.db.freelist.EstimatedWritePageSize()
+		// Capture while still holding the writer lock: Close() may nil out
+		// the freelist as soon as the lock is released.
+		var freelistReuse = tx.db.freelist.ReuseCount()
 
 		// Remove transaction ref & writer lock.
 		tx.db.rwtx = nil
@@ -363,6 +366,7 @@ func (tx *Tx) close() {
 			tx.db.stats.PendingPageN = freelistPendingN
 			tx.db.stats.FreeAlloc = (freelistFreeN + freelistPendingN) * tx.db.pageSize
 			tx.db.stats.FreelistInuse = freelistAlloc
+			tx.db.stats.ReusePageN = freelistReuse
 			tx.db.stats.TxStats.add(&tx.stats)
 			tx.db.statlock.Unlock()
 		}

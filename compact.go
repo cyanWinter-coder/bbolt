@@ -90,9 +90,16 @@ type walkFunc func(keys [][]byte, k, v []byte, seq uint64) error
 // walk walks recursively the bolt database db, calling walkFn for each key it finds.
 func walk(db *DB, walkFn walkFunc) error {
 	return db.View(func(tx *Tx) error {
-		return tx.ForEach(func(name []byte, b *Bucket) error {
-			return walkBucket(b, nil, name, nil, b.Sequence(), walkFn)
-		})
+		return walkTx(tx, walkFn)
+	})
+}
+
+// walkTx walks recursively the database as seen by the read transaction tx,
+// calling walkFn for each key it finds. Keeping the traversal bound to tx lets
+// a compaction read one fixed snapshot for its entire duration.
+func walkTx(tx *Tx, walkFn walkFunc) error {
+	return tx.ForEach(func(name []byte, b *Bucket) error {
+		return walkBucket(b, nil, name, nil, b.Sequence(), walkFn)
 	})
 }
 

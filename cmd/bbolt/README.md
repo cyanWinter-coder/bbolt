@@ -478,6 +478,10 @@ Example 2:
 
 Compact opens a database at given `[Source Path]` and walks it recursively, copying keys as they are found from all buckets, to a newly created database at `[Destination Path]`. The original database is left untouched.
 
+The copy reads the source from a single read transaction, so all copied data comes from one consistent snapshot while other readers keep working. Writes to the destination are committed in size-bounded batches (`--tx-max-size`) to keep memory bounded on large databases. Progress lines report relocated page count and the remaining percentage.
+
+By default the destination must not already exist and the output filesystem is preflighted for enough free space; both checks happen before the source database is opened. The copy is built in a temporary file next to the destination and atomically renamed into place only after it is fully written (and optionally `--verify`-ied). Cancelling with Ctrl-C or any failure removes the temporary file, so no half-written destination is left behind. Pass `--force` to replace an existing destination.
+
 Usage:
 ```
 $ bbolt compact -h
@@ -487,17 +491,23 @@ Usage:
   bbolt compact [options] -o <dst-bbolt-file> <src-bbolt-file> [flags]
 
 Flags:
-  -h, --help              help for compact
+  -f, --force               overwrite the output file if it already exists
+  -h, --help                help for compact
       --no-sync
   -o, --output string
-      --tx-max-size int   (default 65536)
+      --progress            print progress (relocated pages and remaining percentage) (default true)
+      --required-bytes int  additional free-space requirement in bytes for the output filesystem
+      --skip-disk-check     disable the free-space preflight
+      --tx-max-size int     (default 65536)
+      --verify              verify the compacted file with a full consistency check before publishing
 ```
 
 Example:
 
   ```bash
   $bbolt compact -o ~/db.compact ~/default.etcd/member/snap/db
-  16805888 -> 32768 bytes (gain=512.88x)
+  compacting: pages=1629/2624 entries=19007/19007 100.0% done, 0.0% remaining
+  16777216 -> 8388608 bytes (gain=2.00x)
   ```
 
   - It will create a compacted database file: `db.compact` at given path.

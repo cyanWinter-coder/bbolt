@@ -67,7 +67,7 @@ func TestCompactCommand_Run(t *testing.T) {
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
 		c := tx.Bucket([]byte("large_vals")).Cursor()
-		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		for k, _, _ := c.First(); k != nil; k, _, _ = c.Next() {
 			if err := c.Delete(); err != nil {
 				return err
 			}

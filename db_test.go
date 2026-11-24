@@ -2011,7 +2011,7 @@ func ExampleDB_Begin() {
 		log.Fatal(err)
 	}
 	c := tx.Bucket([]byte("widgets")).Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
+	for k, v, _ := c.First(); k != nil; k, v, _ = c.Next() {
 		fmt.Printf("%s likes %s\n", k, v)
 	}
 
@@ -2196,7 +2196,7 @@ func validateBatchBench(b *testing.B, db *btesting.DB) {
 		}
 		// should be empty now
 		c := bucket.Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
+		for k, v, _ := c.First(); k != nil; k, v, _ = c.Next() {
 			b.Errorf("unexpected key: %x = %q", k, v)
 		}
 		return rollback

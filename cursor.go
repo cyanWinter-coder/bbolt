@@ -16,12 +16,24 @@ import (
 //
 // Keys and values returned from the cursor are only valid for the life of the transaction.
 //
-// Changing data while traversing with a cursor may cause it to be invalidated
-// and return unexpected keys and/or values. You must reposition your cursor
-// after mutating data.
+// After a key is deleted through the cursor (see Delete), the cursor stays
+// positioned at the slot the deleted key used to occupy: the following Next
+// call returns the successor of the deleted key and Prev returns its
+// predecessor. Neither the successor nor the predecessor is skipped or
+// returned twice.
+//
+// Using a cursor after its transaction has been committed or rolled back
+// returns errors.ErrTxClosed instead of accessing released pages.
 type Cursor struct {
 	bucket *Bucket
 	stack  []elemRef
+
+	// nextReadCurrent is set by Delete to mark that the key under the
+	// cursor was just removed. The following Next call reads the element
+	// now occupying the deleted key's slot (its successor) instead of
+	// advancing one more element, so the successor is neither skipped nor
+	// returned twice. Any explicit repositioning clears the marker.
+	nextReadCurrent bool
 }
 
 // Bucket returns the bucket that this cursor was created from.
@@ -31,14 +43,19 @@ func (c *Cursor) Bucket() *Bucket {
 
 // First moves the cursor to the first item in the bucket and returns its key and value.
 // If the bucket is empty then a nil key and value are returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
 // The returned key and value are only valid for the life of the transaction.
-func (c *Cursor) First() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+func (c *Cursor) First() (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	c.nextReadCurrent = false
 	k, v, flags := c.first()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
-		return k, nil
+		return k, nil, nil
 	}
-	return k, v
+	return k, v, nil
 }
 
 func (c *Cursor) first() (key []byte, value []byte, flags uint32) {
@@ -62,9 +79,14 @@ func (c *Cursor) first() (key []byte, value []byte, flags uint32) {
 
 // Last moves the cursor to the last item in the bucket and returns its key and value.
 // If the bucket is empty then a nil key and value are returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
 // The returned key and value are only valid for the life of the transaction.
-func (c *Cursor) Last() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+func (c *Cursor) Last() (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	c.nextReadCurrent = false
 	c.stack = c.stack[:0]
 	p, n := c.bucket.pageNode(c.bucket.RootPage())
 	ref := elemRef{page: p, node: n}
@@ -79,46 +101,77 @@ func (c *Cursor) Last() (key []byte, value []byte) {
 	}
 
 	if len(c.stack) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	k, v, flags := c.keyValue()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
-		return k, nil
+		return k, nil, nil
 	}
-	return k, v
+	return k, v, nil
 }
 
 // Next moves the cursor to the next item in the bucket and returns its key and value.
 // If the cursor is at the end of the bucket then a nil key and value are returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
 // The returned key and value are only valid for the life of the transaction.
-func (c *Cursor) Next() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+func (c *Cursor) Next() (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	// After Delete the cursor sits on the slot of the removed key. Read
+	// that slot once so the successor is returned rather than skipped.
+	if c.nextReadCurrent {
+		c.nextReadCurrent = false
+		k, v, flags := c.keyValue()
+		// The slot may be empty when the removed key was the last element
+		// of a leaf page; descend to the next leaf for the successor.
+		if k == nil {
+			k, v, flags = c.next()
+		}
+		if (flags & uint32(common.BucketLeafFlag)) != 0 {
+			return k, nil, nil
+		}
+		return k, v, nil
+	}
 	k, v, flags := c.next()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
-		return k, nil
+		return k, nil, nil
 	}
-	return k, v
+	return k, v, nil
 }
 
 // Prev moves the cursor to the previous item in the bucket and returns its key and value.
 // If the cursor is at the beginning of the bucket then a nil key and value are returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
 // The returned key and value are only valid for the life of the transaction.
-func (c *Cursor) Prev() (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+func (c *Cursor) Prev() (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	// Delete already leaves the cursor on the slot preceding (or now
+	// occupied by) the removed key; Prev must not consume the marker.
+	c.nextReadCurrent = false
 	k, v, flags := c.prev()
 	if (flags & uint32(common.BucketLeafFlag)) != 0 {
-		return k, nil
+		return k, nil, nil
 	}
-	return k, v
+	return k, v, nil
 }
 
 // Seek moves the cursor to a given key using a b-tree search and returns it.
 // If the key does not exist then the next key is used. If no keys
 // follow, a nil key is returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
 // The returned key and value are only valid for the life of the transaction.
-func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
-	common.Assert(c.bucket.tx.db != nil, "tx closed")
+func (c *Cursor) Seek(seek []byte) (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	c.nextReadCurrent = false
 
 	k, v, flags := c.seek(seek)
 
@@ -128,11 +181,59 @@ func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 	}
 
 	if k == nil {
-		return nil, nil
+		return nil, nil, nil
 	} else if (flags & uint32(common.BucketLeafFlag)) != 0 {
-		return k, nil
+		return k, nil, nil
 	}
-	return k, v
+	return k, v, nil
+}
+
+// SeekPrefix moves the cursor to the first item whose key starts with prefix
+// and returns it. Subsequent Next/Prev calls behave exactly like Seek-based
+// iteration; callers typically stop iterating once a key no longer starts
+// with prefix.
+//
+// If end is not nil, iteration is limited to keys strictly smaller than end:
+// the boundary key itself (and anything after it) is never returned. An end
+// smaller than or equal to prefix results in a nil key. A nil end means no
+// upper bound beyond the prefix itself.
+//
+// If no key with the given prefix exists (or none lies before end) then a
+// nil key and value are returned.
+// It returns errors.ErrTxClosed if the transaction that the cursor belongs
+// to has already been committed or rolled back.
+// The returned key and value are only valid for the life of the transaction.
+func (c *Cursor) SeekPrefix(prefix []byte, end []byte) (key []byte, value []byte, err error) {
+	if c.bucket.tx.db == nil {
+		return nil, nil, errors.ErrTxClosed
+	}
+	c.nextReadCurrent = false
+
+	k, v, flags := c.seek(prefix)
+
+	// If we ended up after the last element of a page then move to the next one.
+	if ref := &c.stack[len(c.stack)-1]; ref.index >= ref.count() {
+		k, v, flags = c.next()
+	}
+
+	if k == nil {
+		return nil, nil, nil
+	}
+
+	// An explicit end bound is exclusive.
+	if end != nil && bytes.Compare(k, end) >= 0 {
+		return nil, nil, nil
+	}
+
+	// Without an end bound only keys carrying the prefix belong to the range.
+	if end == nil && !bytes.HasPrefix(k, prefix) {
+		return nil, nil, nil
+	}
+
+	if (flags & uint32(common.BucketLeafFlag)) != 0 {
+		return k, nil, nil
+	}
+	return k, v, nil
 }
 
 // Delete removes the current key/value under the cursor from the bucket.
@@ -149,7 +250,19 @@ func (c *Cursor) Delete() error {
 	if (flags & common.BucketLeafFlag) != 0 {
 		return errors.ErrIncompatibleValue
 	}
-	c.node().del(key)
+	n := c.node()
+	n.del(key)
+
+	// The materialized node, not the (possibly stale) page, is now
+	// authoritative for the cursor's leaf ref. Pointing the stack top at
+	// it keeps the index meaningful after the inode shifted.
+	ref := &c.stack[len(c.stack)-1]
+	ref.node = n
+	ref.page = nil
+
+	// The next Next call should read whatever occupies this slot now so
+	// the successor of the removed key is not skipped.
+	c.nextReadCurrent = true
 
 	return nil
 }
@@ -165,7 +278,8 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	return c.keyValue()
 }
 
-// first moves the cursor to the first leaf element under the last page in the stack.
+// goToFirstElementOnTheStack moves the cursor to the first leaf element under
+// the last page in the stack.
 func (c *Cursor) goToFirstElementOnTheStack() {
 	for {
 		// Exit when we hit a leaf page.
@@ -248,35 +362,51 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 
 // prev moves the cursor to the previous item in the bucket and returns its key and value.
 // If the cursor is at the beginning of the bucket then a nil key and value are returned.
+//
+// The cursor position is adjusted before moving so that deleting the current
+// key (see Delete) does not skip or duplicate its predecessor: the slot the
+// deleted key used to occupy is treated as the current position. Empty leaf
+// pages left behind by deletes are skipped the same way next() skips them.
 func (c *Cursor) prev() (key []byte, value []byte, flags uint32) {
-	// Attempt to move back one element until we're successful.
-	// Move up the stack as we hit the beginning of each page in our stack.
-	for i := len(c.stack) - 1; i >= 0; i-- {
-		elem := &c.stack[i]
-		if elem.index > 0 {
-			elem.index--
-			break
+	for {
+		// Attempt to move back one element until we're successful.
+		// Move up the stack as we hit the beginning of each page in our stack.
+		var i int
+		for i = len(c.stack) - 1; i >= 0; i-- {
+			elem := &c.stack[i]
+			if elem.index > 0 {
+				elem.index--
+				break
+			}
+			// If we've hit the beginning, we should stop moving the cursor,
+			// and stay at the first element, so that users can continue to
+			// iterate over the elements in reverse direction by calling `Next`.
+			// We should return nil in such case.
+			// Refer to https://github.com/etcd-io/bbolt/issues/733
+			if len(c.stack) == 1 {
+				c.first()
+				return nil, nil, 0
+			}
+			c.stack = c.stack[:i]
 		}
-		// If we've hit the beginning, we should stop moving the cursor,
-		// and stay at the first element, so that users can continue to
-		// iterate over the elements in reverse direction by calling `Next`.
-		// We should return nil in such case.
-		// Refer to https://github.com/etcd-io/bbolt/issues/733
-		if len(c.stack) == 1 {
-			c.first()
+
+		// If we've hit the end then return nil.
+		if len(c.stack) == 0 {
 			return nil, nil, 0
 		}
-		c.stack = c.stack[:i]
-	}
 
-	// If we've hit the end then return nil.
-	if len(c.stack) == 0 {
-		return nil, nil, 0
-	}
+		// Move down the stack to find the last element of the last leaf under this branch.
+		c.last()
 
-	// Move down the stack to find the last element of the last leaf under this branch.
-	c.last()
-	return c.keyValue()
+		// Empty leaf pages can be left behind by Delete(). Skip them and keep
+		// moving backwards so items on earlier pages are not missed.
+		// https://github.com/boltdb/bolt/issues/450
+		if c.stack[len(c.stack)-1].count() == 0 {
+			continue
+		}
+
+		return c.keyValue()
+	}
 }
 
 // search recursively performs a binary search against a given page/node until it finds a given key.

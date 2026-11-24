@@ -102,7 +102,7 @@ func TestBucket_Get_Capacity(t *testing.T) {
 
 	// Retrieve value and attempt to append to it.
 	if err := db.Update(func(tx *bolt.Tx) error {
-		k, v := tx.Bucket([]byte("bucket")).Cursor().First()
+		k, v, _ := tx.Bucket([]byte("bucket")).Cursor().First()
 
 		// Verify capacity.
 		if len(k) != cap(k) {
@@ -407,7 +407,7 @@ func TestBucket_Delete_FreelistOverflow(t *testing.T) {
 	if err := db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("0"))
 		c := b.Cursor()
-		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		for k, _, _ := c.First(); k != nil; k, _, _ = c.Next() {
 			if err := c.Delete(); err != nil {
 				t.Fatal(err)
 			}

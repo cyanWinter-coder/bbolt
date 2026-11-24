@@ -448,7 +448,10 @@ func runReadsSequential(cmd *cobra.Command, db *bolt.DB, options *benchOptions, 
 				defer func() { results.addCompletedOps(numReads) }()
 
 				c := tx.Bucket(benchBucketName).Cursor()
-				for k, v := c.First(); k != nil; k, v = c.Next() {
+				for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+					if err != nil {
+						return err
+					}
 					numReads++
 					if v == nil {
 						return ErrInvalidValue
@@ -526,7 +529,10 @@ func runReadsSequentialNested(cmd *cobra.Command, db *bolt.DB, options *benchOpt
 				defer func() { results.addCompletedOps(numReads) }()
 				if b := top.Bucket(name); b != nil {
 					c := b.Cursor()
-					for k, v := c.First(); k != nil; k, v = c.Next() {
+					for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+						if err != nil {
+							return err
+						}
 						numReads++
 						if v == nil {
 							return ErrInvalidValue

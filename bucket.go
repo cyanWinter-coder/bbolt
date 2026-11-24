@@ -660,7 +660,10 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 		return errors.ErrTxClosed
 	}
 	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
+	for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+		if err != nil {
+			return err
+		}
 		if err := fn(k, v); err != nil {
 			return err
 		}

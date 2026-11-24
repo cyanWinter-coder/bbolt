@@ -430,7 +430,10 @@ db.View(func(tx *bolt.Tx) error {
 
 	c := b.Cursor()
 
-	for k, v := c.First(); k != nil; k, v = c.Next() {
+	for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+		if err != nil {
+			return err
+		}
 		fmt.Printf("key=%s, value=%s\n", k, v)
 	}
 
@@ -444,14 +447,18 @@ forward or backward through the keys one at a time.
 The following functions are available on the cursor:
 
 ```
-First()  Move to the first key.
-Last()   Move to the last key.
-Seek()   Move to a specific key.
-Next()   Move to the next key.
-Prev()   Move to the previous key.
+First()       Move to the first key.
+Last()        Move to the last key.
+Seek()        Move to a specific key.
+SeekPrefix()  Move to the first key with a given prefix.
+Next()        Move to the next key.
+Prev()        Move to the previous key.
 ```
 
-Each of those functions has a return signature of `(key []byte, value []byte)`.
+Each of those functions has a return signature of
+`(key []byte, value []byte, err error)`. The error is
+`errors.ErrTxClosed` if the owning transaction has already been committed
+or rolled back; otherwise it is nil.
 You must seek to a position using `First()`, `Last()`, or `Seek()` before calling
 `Next()` or `Prev()`. If you do not seek to a position then these functions will
 return a `nil` key.
@@ -461,10 +468,11 @@ When you have iterated to the end of the cursor, then `Next()` will return a
 have iterated to the beginning of the cursor, then `Prev()` will return a `nil`
 key and the cursor still points to the first element if present.
 
-If you remove key/value pairs during iteration, the cursor may automatically
-move to the next position if present in current node each time removing a key.
-When you call `c.Next()` after removing a key, it may skip one key/value pair.
-Refer to [pull/611](https://github.com/etcd-io/bbolt/pull/611) to get more detailed info.
+If you remove the key/value pair under the cursor with `c.Delete()`, the cursor
+stays positioned at the slot the removed key used to occupy: the following
+`Next()` call returns the successor of the removed key and `Prev()` returns its
+predecessor, so no key/value pair is skipped or returned twice. This also holds
+when deletes empty out whole leaf pages.
 
 During iteration, if the key is non-`nil` but the value is `nil`, that means
 the key refers to a bucket rather than a value.  Use `Bucket.Bucket()` to
@@ -481,7 +489,32 @@ db.View(func(tx *bolt.Tx) error {
 	c := tx.Bucket([]byte("MyBucket")).Cursor()
 
 	prefix := []byte("1234")
-	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+	for k, v, err := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v, err = c.Next() {
+		if err != nil {
+			return err
+		}
+		fmt.Printf("key=%s, value=%s\n", k, v)
+	}
+
+	return nil
+})
+```
+
+`SeekPrefix()` combines the initial seek with an optional exclusive end
+boundary. Passing `nil` for `end` limits the result to keys carrying the
+prefix; when `end` is not nil, keys are additionally limited to those strictly
+smaller than `end`, so the boundary key itself is never returned:
+
+```go
+db.View(func(tx *bolt.Tx) error {
+	c := tx.Bucket([]byte("MyBucket")).Cursor()
+
+	prefix := []byte("1234/")
+	end := []byte("1234/9999") // exclusive
+	for k, v, err := c.SeekPrefix(prefix, end); k != nil && bytes.Compare(k, end) < 0; k, v, err = c.Next() {
+		if err != nil {
+			return err
+		}
 		fmt.Printf("key=%s, value=%s\n", k, v)
 	}
 
@@ -505,7 +538,10 @@ db.View(func(tx *bolt.Tx) error {
 	max := []byte("2000-01-01T00:00:00Z")
 
 	// Iterate over the 90's.
-	for k, v := c.Seek(min); k != nil && bytes.Compare(k, max) <= 0; k, v = c.Next() {
+	for k, v, err := c.Seek(min); k != nil && bytes.Compare(k, max) <= 0; k, v, err = c.Next() {
+		if err != nil {
+			return err
+		}
 		fmt.Printf("%s: %s\n", k, v)
 	}
 

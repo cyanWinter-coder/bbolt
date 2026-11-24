@@ -137,19 +137,19 @@ func TestTx_Cursor(t *testing.T) {
 		}
 
 		c := tx.Cursor()
-		if k, v := c.First(); !bytes.Equal(k, []byte("widgets")) {
+		if k, v, _ := c.First(); !bytes.Equal(k, []byte("widgets")) {
 			t.Fatalf("unexpected key: %v", k)
 		} else if v != nil {
 			t.Fatalf("unexpected value: %v", v)
 		}
 
-		if k, v := c.Next(); !bytes.Equal(k, []byte("woojits")) {
+		if k, v, _ := c.Next(); !bytes.Equal(k, []byte("woojits")) {
 			t.Fatalf("unexpected key: %v", k)
 		} else if v != nil {
 			t.Fatalf("unexpected value: %v", v)
 		}
 
-		if k, v := c.Next(); k != nil {
+		if k, v, _ := c.Next(); k != nil {
 			t.Fatalf("unexpected key: %v", k)
 		} else if v != nil {
 			t.Fatalf("unexpected value: %v", k)

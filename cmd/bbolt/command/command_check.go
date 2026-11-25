@@ -12,18 +12,25 @@ import (
 
 type checkOptions struct {
 	fromPageID uint64
+	report     bool
+	format     string
+	json       bool
 }
 
 func (o *checkOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.Uint64VarP(&o.fromPageID, "from-page", "", o.fromPageID, "check db integrity starting from the given page ID")
+	fs.BoolVar(&o.report, "report", false, "emit a categorized report with bucket paths and first bad keys")
+	fs.StringVar(&o.format, "format", "text", "report output format when --report is set: text|json")
+	fs.BoolVar(&o.json, "json", false, "shorthand for --report --format=json")
 }
 
 func newCheckCommand() *cobra.Command {
 	var o checkOptions
 	checkCmd := &cobra.Command{
-		Use:   "check <bbolt-file>",
-		Short: "verify integrity of bbolt database data",
-		Args:  cobra.ExactArgs(1),
+		Use:          "check <bbolt-file>",
+		Short:        "verify integrity of bbolt database data",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return checkFunc(cmd, args[0], o)
 		},
@@ -36,6 +43,17 @@ func newCheckCommand() *cobra.Command {
 func checkFunc(cmd *cobra.Command, dbPath string, cfg checkOptions) error {
 	if _, err := checkSourceDBPath(dbPath); err != nil {
 		return err
+	}
+
+	if cfg.json || cfg.format == "json" {
+		cfg.report = true
+		cfg.format = "json"
+	}
+	if cfg.report {
+		if cfg.fromPageID != 0 {
+			return fmt.Errorf("--report checks all buckets and pages and cannot be combined with --from-page")
+		}
+		return runDoctor(cmd, dbPath, doctorOptions{format: cfg.format, json: cfg.json})
 	}
 
 	// Open database.

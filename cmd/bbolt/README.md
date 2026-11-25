@@ -160,6 +160,9 @@ Usage:
 
 Flags:
       --from-page uint   check db integrity starting from the given page ID
+      --report           emit a categorized localization report
+      --format string    report format: text|json (default "text")
+      --json             shorthand for --report --format=json
   -h, --help             help for check
 ```
 
@@ -171,6 +174,22 @@ ok
 ```
 
 - It returns `ok` as our database file `db` is not corrupted.
+
+For a power-loss or suspected page-leak investigation, use the read-only report.
+It opens the file `O_RDONLY` without taking bbolt's lock, validates both meta
+pages, the active freelist, all reachable buckets (including inline buckets
+and their embedded pages), and prints page numbers, bucket paths, and the first
+bad key where available. An unparseable page stops only its branch:
+
+```bash
+$ bbolt check ~/default.etcd/member/snap/db --report
+$ bbolt check ~/default.etcd/member/snap/db --json > report.json
+$ bbolt doctor ~/default.etcd/member/snap/db --format json
+```
+
+`bbolt doctor` is an alias for the same report. The command exits non-zero when
+the report status is `corrupt`. JSON output has a stable schema and empty
+`issues` / `branch_stops` arrays for a healthy database.
 
 ### stats
 

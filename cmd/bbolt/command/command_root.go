@@ -24,6 +24,7 @@ func NewRootCommand() *cobra.Command {
 		newSurgeryCommand(),
 		newInspectCommand(),
 		newCheckCommand(),
+		newDoctorCommand(),
 		newBucketsCommand(),
 		newInfoCommand(),
 		newCompactCommand(),

@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -121,6 +122,10 @@ type DB struct {
 	path     string
 	openFile func(string, int, os.FileMode) (*os.File, error)
 	file     *os.File
+	// `dataref`, `data`, `datasz`, `meta0` and `meta1` describe the currently
+	// installed mapping. They are kept in sync with current and allow platform
+	// code and the non-transactional helpers to keep their existing shape.
+	//
 	// `dataref` isn't used at all on Windows, and the golangci-lint
 	// always fails on Windows platform.
 	//nolint
@@ -144,8 +149,12 @@ type DB struct {
 
 	rwlock   sync.Mutex   // Allows only one writer at a time.
 	metalock sync.Mutex   // Protects meta page access.
-	mmaplock sync.RWMutex // Protects mmap access during remapping.
+	mmaplock sync.RWMutex // Makes Close wait for transactions and coordinates mapping lifecycle.
 	statlock sync.RWMutex // Protects stats access.
+
+	remapMu sync.Mutex   // Serializes mapping creation and growth.
+	mapMu   sync.RWMutex // Protects current and mapping reference acquisition.
+	current *mapping     // Currently installed mapping generation.
 
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
@@ -272,10 +281,21 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	} else if info.Size() == 0 {
 		// Initialize new files with meta pages.
 		if err = db.init(); err != nil {
-			// clean up file descriptor on initialization fail
+			filePath := db.path
+			// Clean up file descriptor and lock before touching the path. The
+			// file was empty immediately before initialization, so removing a
+			// partially initialized file lets a later Open retry cleanly.
 			_ = db.close()
-			lg.Errorf("failed to initialize db file (%s): %v", path, err)
-			return nil, err
+			// Only a writable Open owns initialization/cleanup. A read-only
+			// Open must not unlink a path it could not initialize.
+			if !db.readOnly {
+				if removeErr := os.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
+					lg.Errorf("failed to remove partially initialized db file (%s): %v", filePath, removeErr)
+				}
+			}
+			initErr := fmt.Errorf("initializing database %q failed: %w", path, err)
+			lg.Errorf("%v", initErr)
+			return nil, initErr
 		}
 	} else {
 		// try to get the page size from the metadata pages
@@ -451,22 +471,88 @@ func (db *DB) fileSize() (int, error) {
 	return sz, nil
 }
 
+// mapping is one memory-map generation. A transaction retains a reference to
+// the generation it started from, allowing the DB to install a new, larger
+// generation without invalidating pointers still used by an older read.
+type mapping struct {
+	// `dataref` isn't used at all on Windows, and the golangci-lint
+	// always fails on Windows platform.
+	//nolint
+	dataref []byte // mmap'ed readonly, write throws SEGV
+	data    *[common.MaxMapSize]byte
+	datasz  int
+
+	meta0 *common.Meta
+	meta1 *common.Meta
+
+	// refs includes one owner reference held by DB.current plus one reference
+	// for every transaction using this generation.
+	refs atomic.Int64
+}
+
+func (m *mapping) retain() {
+	m.refs.Add(1)
+}
+
+func (m *mapping) page(id common.Pgid, pageSize int) *common.Page {
+	pos := id * common.Pgid(pageSize)
+	return (*common.Page)(unsafe.Pointer(&m.data[pos]))
+}
+
+// meta returns the valid meta page with the higher transaction ID.
+func (m *mapping) meta() *common.Meta {
+	metaA := m.meta0
+	metaB := m.meta1
+	if m.meta1.Txid() > m.meta0.Txid() {
+		metaA = m.meta1
+		metaB = m.meta0
+	}
+
+	if err := metaA.Validate(); err == nil {
+		return metaA
+	} else if err := metaB.Validate(); err == nil {
+		return metaB
+	}
+
+	// This should never be reached for an installed mapping because both meta
+	// pages were validated before installation.
+	panic("bolt.mapping.meta(): invalid meta pages")
+}
+
 // mmap opens the underlying memory-mapped file and initializes the meta references.
 // minsz is the minimum size that the new mmap can be.
-func (db *DB) mmap(minsz int) (err error) {
-	db.mmaplock.Lock()
-	defer db.mmaplock.Unlock()
+//
+// A new generation is mapped and validated before the current generation is
+// replaced. If creating or preparing the new generation fails, the current
+// generation remains installed and usable. Old generations stay mapped until
+// every transaction that retained them has finished.
+func (db *DB) mmap(minsz int) error {
+	// Remaps are serialized separately from the mmaplock so that they can run
+	// concurrently with transactions holding mmaplock.RLock. Close takes the
+	// exclusive mmaplock and therefore cannot close the file during a remap.
+	db.remapMu.Lock()
+	defer db.remapMu.Unlock()
+
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
+
+	if !db.opened || db.file == nil {
+		return berrors.ErrDatabaseNotOpen
+	}
 
 	lg := db.Logger()
 
+	db.mapMu.RLock()
+	current := db.current
+	db.mapMu.RUnlock()
+
 	// Ensure the size is at least the minimum size.
-	var fileSize int
-	fileSize, err = db.fileSize()
+	fileSize, err := db.fileSize()
 	if err != nil {
 		lg.Errorf("getting file size failed: %v", err)
 		return err
 	}
-	var size = fileSize
+	size := fileSize
 	if size < minsz {
 		size = minsz
 	}
@@ -493,63 +579,106 @@ func (db *DB) mmap(minsz int) (err error) {
 		}
 	}
 
-	if db.Mlock {
-		// Unlock db memory
-		if err := db.munlock(fileSize); err != nil {
-			return err
-		}
+	// An already sufficiently large generation can continue to serve the
+	// request. This also makes retries after a failed growth deterministic.
+	if current != nil && size <= current.datasz {
+		return nil
 	}
 
-	// Dereference all mmap references before unmapping.
+	// Memory-map the new generation without touching the current one.
+	// gofail: var mapError string
+	// return errors.New(mapError)
+	next, err := mmap(db, size)
+	if err != nil {
+		// On Windows mmap may have extended the file before the mapping
+		// failed. Best-effort restore the pre-remap size for a clean retry.
+		db.tryRestoreFileSize(fileSize)
+		lg.Errorf("[GOOS: %s, GOARCH: %s] mmap failed, path: %s, requested size: %d, file size: %d, readonly: %t, error: %v",
+			runtime.GOOS, runtime.GOARCH, db.path, size, fileSize, db.readOnly, err)
+		return fmt.Errorf("%w: mmap %q failed at size %d (file size %d): %w",
+			berrors.ErrInvalidMapping, db.path, size, fileSize, err)
+	}
+	next.refs.Store(1)
+	next.meta0 = next.page(0, db.pageSize).Meta()
+	next.meta1 = next.page(1, db.pageSize).Meta()
+
+	abortNext := func(cause error) error {
+		if unmapErr := next.munmap(); unmapErr != nil {
+			cause = fmt.Errorf("%w; rollback unmapping also failed: %v", cause, unmapErr)
+		}
+		// Windows may have extended the file while creating next. Restore the
+		// pre-remap file size when possible so a retry starts from the same state.
+		db.tryRestoreFileSize(fileSize)
+		return cause
+	}
+
+	// Validate the meta pages on the new generation before switching to it.
+	// We only return an error if both meta pages fail validation, since meta0
+	// failing validation means that it wasn't saved properly -- but we can
+	// recover using meta1. And vice-versa.
+	err0 := next.meta0.Validate()
+	err1 := next.meta1.Validate()
+	if err0 != nil && err1 != nil {
+		lg.Errorf("both meta pages are invalid, meta0: %v, meta1: %v", err0, err1)
+		return abortNext(err0)
+	}
+
+	// Dereference write-transaction pointers before the old generation can be
+	// released. Retaining the mapping already keeps them valid, but copying
+	// mmap-backed keys/values to the heap preserves the historical behavior.
 	if db.rwtx != nil {
 		db.rwtx.root.dereference()
 	}
 
-	// Unmap existing data before continuing.
-	if err = db.munmap(); err != nil {
-		return err
-	}
-
-	// Memory-map the data file as a byte slice.
-	// gofail: var mapError string
-	// return errors.New(mapError)
-	if err = mmap(db, size); err != nil {
-		lg.Errorf("[GOOS: %s, GOARCH: %s] mmap failed, size: %d, error: %v", runtime.GOOS, runtime.GOARCH, size, err)
-		return err
-	}
-
-	// Perform unmmap on any error to reset all data fields:
-	// dataref, data, datasz, meta0 and meta1.
-	defer func() {
-		if err != nil {
-			if unmapErr := db.munmap(); unmapErr != nil {
-				err = fmt.Errorf("%w; rollback unmap also failed: %v", err, unmapErr)
+	if db.Mlock {
+		// Release the old range before locking the new one to avoid charging
+		// both generations against RLIMIT_MEMLOCK. If locking the new range
+		// fails, best-effort relock the old generation and keep it installed.
+		if current != nil {
+			if err := db.munlock(current, fileSize); err != nil {
+				return abortNext(err)
 			}
 		}
-	}()
+		if err := db.mlock(next, fileSize); err != nil {
+			if current != nil {
+				if relockErr := db.mlock(current, fileSize); relockErr != nil {
+					lg.Errorf("relocking previous mapping failed after mlock failure: %v", relockErr)
+				}
+			}
+			return abortNext(err)
+		}
+	}
 
-	if db.Mlock {
-		// Don't allow swapping of data file
-		if err := db.mlock(fileSize); err != nil {
+	// Atomically install the complete new generation.
+	db.mapMu.Lock()
+	old := db.current
+	db.current = next
+	db.installMappingFields(next)
+	db.mapMu.Unlock()
+
+	// The remapMu serialization guarantees old is current. Release the DB's
+	// owner reference; any open transaction still holds its own reference and
+	// therefore keeps the old generation mapped until it closes.
+	if old == nil {
+		// Preserve the historical unmap failpoint hook on the initial mapping.
+		if err := db.unmapMapping(nil); err != nil {
+			return err
+		}
+	} else if old != next {
+		if err := db.releaseMapping(old); err != nil {
 			return err
 		}
 	}
 
-	// Save references to the meta pages.
-	db.meta0 = db.page(0).Meta()
-	db.meta1 = db.page(1).Meta()
-
-	// Validate the meta pages. We only return an error if both meta pages fail
-	// validation, since meta0 failing validation means that it wasn't saved
-	// properly -- but we can recover using meta1. And vice-versa.
-	err0 := db.meta0.Validate()
-	err1 := db.meta1.Validate()
-	if err0 != nil && err1 != nil {
-		lg.Errorf("both meta pages are invalid, meta0: %v, meta1: %v", err0, err1)
-		return err0
-	}
-
 	return nil
+}
+
+func (db *DB) installMappingFields(m *mapping) {
+	db.dataref = m.dataref
+	db.data = m.data
+	db.datasz = m.datasz
+	db.meta0 = m.meta0
+	db.meta1 = m.meta1
 }
 
 func (db *DB) invalidate() {
@@ -561,18 +690,48 @@ func (db *DB) invalidate() {
 	db.meta1 = nil
 }
 
-// munmap unmaps the data file from memory.
+// releaseMapping drops one transaction/owner reference and unmaps the
+// generation once no references remain.
+func (db *DB) releaseMapping(m *mapping) error {
+	if m == nil {
+		return nil
+	}
+	if remaining := m.refs.Add(-1); remaining > 0 {
+		return nil
+	}
+	return db.unmapMapping(m)
+}
+
+// unmapMapping unmaps one mapping generation. It is the single unmap
+// failpoint and logging boundary.
+func (db *DB) unmapMapping(m *mapping) error {
+	// gofail: var unmapError string
+	// return errors.New(unmapError)
+	if m == nil {
+		return nil
+	}
+	if err := m.munmap(); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munmap failed, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, m.datasz, err)
+		return fmt.Errorf("unmap error: %w", err)
+	}
+	return nil
+}
+
+// munmap releases the currently installed generation from the DB. Open
+// transactions have already released their references by the time Close
+// holds mmaplock.Lock.
 func (db *DB) munmap() error {
 	defer db.invalidate()
 
-	// gofail: var unmapError string
-	// return errors.New(unmapError)
-	if err := munmap(db); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munmap failed, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, db.datasz, err)
-		return fmt.Errorf("unmap error: %w", err)
-	}
+	db.mapMu.Lock()
+	m := db.current
+	db.current = nil
+	db.mapMu.Unlock()
 
-	return nil
+	if m == nil {
+		return nil
+	}
+	return db.releaseMapping(m)
 }
 
 // mmapSize determines the appropriate size for the mmap given the current size
@@ -612,31 +771,31 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
-func (db *DB) munlock(fileSize int) error {
+func (db *DB) munlock(m *mapping, fileSize int) error {
 	// gofail: var munlockError string
 	// return errors.New(munlockError)
-	if err := munlock(db, fileSize); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, db.datasz, err)
+	if err := munlock(m, fileSize); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] munlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, m.datasz, err)
 		return fmt.Errorf("munlock error: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) mlock(fileSize int) error {
+func (db *DB) mlock(m *mapping, fileSize int) error {
 	// gofail: var mlockError string
 	// return errors.New(mlockError)
-	if err := mlock(db, fileSize); err != nil {
-		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] mlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, db.datasz, err)
+	if err := mlock(m, fileSize); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] mlock failed, fileSize: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, fileSize, m.datasz, err)
 		return fmt.Errorf("mlock error: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) mrelock(fileSizeFrom, fileSizeTo int) error {
-	if err := db.munlock(fileSizeFrom); err != nil {
+func (db *DB) mrelock(m *mapping, fileSizeFrom, fileSizeTo int) error {
+	if err := db.munlock(m, fileSizeFrom); err != nil {
 		return err
 	}
-	if err := db.mlock(fileSizeTo); err != nil {
+	if err := db.mlock(m, fileSizeTo); err != nil {
 		return err
 	}
 	return nil
@@ -753,17 +912,14 @@ func (db *DB) close() error {
 // will cause the calls to block and be serialized until the current write
 // transaction finishes.
 //
-// Transactions should not be dependent on one another. Opening a read
-// transaction and a write transaction in the same goroutine can cause the
-// writer to deadlock because the database periodically needs to re-mmap itself
-// as it grows and it cannot do that while a read transaction is open.
-//
-// If a long running read transaction (for example, a snapshot transaction) is
-// needed, you might want to set DB.InitialMmapSize to a large enough value
-// to avoid potential blocking of write transaction.
+// Transactions should not be dependent on one another. A long-running read
+// transaction retains the mapping generation it started from while the DB is
+// grown, so it is not interrupted by a remap. The retained generation is
+// released when the transaction closes; InitialMmapSize can still be used to
+// reduce the number of generations for very large databases.
 //
 // IMPORTANT: You must close read-only transactions after you are finished or
-// else the database will not reclaim old pages.
+// else the database will not reclaim old pages or old mapping generations.
 func (db *DB) Begin(writable bool) (t *Tx, err error) {
 	if lg := db.Logger(); lg != discardLogger {
 		lg.Debugf("Starting a new transaction [writable: %t]", writable)
@@ -789,15 +945,34 @@ func (db *DB) Logger() Logger {
 	return db.logger
 }
 
+func (db *DB) acquireMapping() *mapping {
+	db.mapMu.RLock()
+	defer db.mapMu.RUnlock()
+	m := db.current
+	if m != nil {
+		m.retain()
+	}
+	return m
+}
+
+// currentMapping returns the installed generation without adding a reference.
+// Callers that use it beyond db.mapMu's lock must retain/release it.
+func (db *DB) currentMapping() *mapping {
+	db.mapMu.RLock()
+	defer db.mapMu.RUnlock()
+	return db.current
+}
+
 func (db *DB) beginTx() (*Tx, error) {
 	// Lock the meta pages while we initialize the transaction. We obtain
 	// the meta lock before the mmap lock because that's the order that the
 	// write transaction will obtain them.
 	db.metalock.Lock()
 
-	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
-	// obtain a write lock so all transactions must finish before it can be
-	// remapped.
+	// Read transactions hold an mmaplock read lock for their lifetime. This
+	// lets Close wait for them, while a remap only needs another read lock and
+	// therefore does not have to wait for them. The transaction additionally
+	// retains its own mapping generation so its pointers stay valid.
 	db.mmaplock.RLock()
 
 	// Exit if the database is not open yet.
@@ -807,15 +982,20 @@ func (db *DB) beginTx() (*Tx, error) {
 		return nil, berrors.ErrDatabaseNotOpen
 	}
 
+	m := db.acquireMapping()
+
 	// Exit if the database is not correctly mapped.
-	if db.data == nil {
+	if m == nil || m.data == nil {
+		if m != nil {
+			_ = db.releaseMapping(m)
+		}
 		db.mmaplock.RUnlock()
 		db.metalock.Unlock()
 		return nil, berrors.ErrInvalidMapping
 	}
 
 	// Create a transaction associated with the database.
-	t := &Tx{}
+	t := &Tx{mapping: m}
 	t.init(db)
 
 	if db.freelist != nil {
@@ -857,14 +1037,19 @@ func (db *DB) beginRWTx() (*Tx, error) {
 		return nil, berrors.ErrDatabaseNotOpen
 	}
 
+	m := db.acquireMapping()
+
 	// Exit if the database is not correctly mapped.
-	if db.data == nil {
+	if m == nil || m.data == nil {
+		if m != nil {
+			_ = db.releaseMapping(m)
+		}
 		db.rwlock.Unlock()
 		return nil, berrors.ErrInvalidMapping
 	}
 
 	// Create a transaction associated with the database.
-	t := &Tx{writable: true}
+	t := &Tx{writable: true, mapping: m}
 	t.init(db)
 	db.rwtx = t
 	db.freelist.ReleasePendingPages()
@@ -873,6 +1058,15 @@ func (db *DB) beginRWTx() (*Tx, error) {
 
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
+	// Release the mapping generation before releasing the mmap read lock. Once
+	// Close acquires the exclusive lock, the mapping reference is gone.
+	if tx.mapping != nil {
+		if err := db.releaseMapping(tx.mapping); err != nil {
+			db.Logger().Errorf("releasing read transaction mapping failed: %v", err)
+		}
+		tx.mapping = nil
+	}
+
 	// Release the read lock on the mmap.
 	db.mmaplock.RUnlock()
 
@@ -1122,14 +1316,21 @@ func (db *DB) Stats() Stats {
 // This is for internal access to the raw data bytes from the C cursor, use
 // carefully, or not at all.
 func (db *DB) Info() *Info {
-	common.Assert(db.data != nil, "database file isn't correctly mapped")
-	return &Info{uintptr(unsafe.Pointer(&db.data[0])), db.pageSize}
+	db.mapMu.RLock()
+	m := db.current
+	db.mapMu.RUnlock()
+	common.Assert(m != nil && m.data != nil, "database file isn't correctly mapped")
+	return &Info{uintptr(unsafe.Pointer(&m.data[0])), db.pageSize}
 }
 
-// page retrieves a page reference from the mmap based on the current page size.
+// page retrieves a page reference from the current mmap based on the page size.
+// Transactional callers should use Tx.page so they stay on their retained
+// mapping generation.
 func (db *DB) page(id common.Pgid) *common.Page {
-	pos := id * common.Pgid(db.pageSize)
-	return (*common.Page)(unsafe.Pointer(&db.data[pos]))
+	db.mapMu.RLock()
+	m := db.current
+	db.mapMu.RUnlock()
+	return m.page(id, db.pageSize)
 }
 
 // pageInBuffer retrieves a page reference from a given byte array based on the current page size.
@@ -1139,26 +1340,10 @@ func (db *DB) pageInBuffer(b []byte, id common.Pgid) *common.Page {
 
 // meta retrieves the current meta page reference.
 func (db *DB) meta() *common.Meta {
-	// We have to return the meta with the highest txid which doesn't fail
-	// validation. Otherwise, we can cause errors when in fact the database is
-	// in a consistent state. metaA is the one with the higher txid.
-	metaA := db.meta0
-	metaB := db.meta1
-	if db.meta1.Txid() > db.meta0.Txid() {
-		metaA = db.meta1
-		metaB = db.meta0
-	}
-
-	// Use higher meta page if valid. Otherwise, fallback to previous, if valid.
-	if err := metaA.Validate(); err == nil {
-		return metaA
-	} else if err := metaB.Validate(); err == nil {
-		return metaB
-	}
-
-	// This should never be reached, because both meta1 and meta0 were validated
-	// on mmap() and we do fsync() on every write.
-	panic("bolt.DB.meta(): invalid meta pages")
+	db.mapMu.RLock()
+	m := db.current
+	db.mapMu.RUnlock()
+	return m.meta()
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
@@ -1204,11 +1389,10 @@ func (db *DB) allocate(txid common.Txid, count int) (*common.Page, error) {
 	}
 	if minsz >= db.datasz {
 		if err := db.mmap(minsz); err != nil {
-			if err == berrors.ErrMaxSizeReached {
+			if errors.Is(err, berrors.ErrMaxSizeReached) {
 				return nil, err
-			} else {
-				return nil, fmt.Errorf("mmap allocate error: %s", err)
 			}
+			return nil, fmt.Errorf("mmap allocate error: %w", err)
 		}
 	}
 
@@ -1221,6 +1405,13 @@ func (db *DB) allocate(txid common.Txid, count int) (*common.Page, error) {
 
 // grow grows the size of the database to the given sz.
 func (db *DB) grow(sz int) error {
+	// A read-only database must never grow its file. Public write transactions
+	// are rejected earlier; keep this guard for internal/direct callers too.
+	if db.readOnly {
+		db.Logger().Errorf("refusing to grow read-only database %q", db.path)
+		return berrors.ErrDatabaseReadOnly
+	}
+
 	// Ignore if the new size is less than available file size.
 	lg := db.Logger()
 	fileSize, err := db.fileSize()
@@ -1236,28 +1427,60 @@ func (db *DB) grow(sz int) error {
 
 	// Truncate and fsync to ensure file size metadata is flushed.
 	// https://github.com/boltdb/bolt/issues/284
-	if !db.NoGrowSync && !db.readOnly {
+	if !db.NoGrowSync {
 		if runtime.GOOS != "windows" {
 			// gofail: var resizeFileError string
 			// return errors.New(resizeFileError)
 			if err := db.file.Truncate(int64(sz)); err != nil {
-				lg.Errorf("[GOOS: %s, GOARCH: %s] truncating file failed, size: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, sz, db.datasz, err)
-				return fmt.Errorf("file resize error: %s", err)
+				lg.Errorf("[GOOS: %s, GOARCH: %s] truncating file failed, path: %s, size: %d, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, db.path, sz, db.datasz, err)
+				return fmt.Errorf("file resize error for %q at size %d: %w", db.path, sz, err)
 			}
 		}
-		if err := db.file.Sync(); err != nil {
-			lg.Errorf("[GOOS: %s, GOARCH: %s] syncing file failed, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, db.datasz, err)
-			return fmt.Errorf("file sync error: %s", err)
+		syncErr := db.file.Sync()
+		// gofail: var syncFileError string
+		// syncErr = errors.New(syncFileError)
+		if syncErr != nil {
+			lg.Errorf("[GOOS: %s, GOARCH: %s] syncing file failed, path: %s, db.datasz: %d, error: %v", runtime.GOOS, runtime.GOARCH, db.path, db.datasz, syncErr)
+			// The truncate may already have extended the file. Restore the
+			// previous size best effort so repeated attempts start consistently.
+			db.tryRestoreFileSize(fileSize)
+			return fmt.Errorf("file sync error for %q: %w", db.path, syncErr)
 		}
 		if db.Mlock {
+			m := db.currentMapping()
 			// unlock old file and lock new one
-			if err := db.mrelock(fileSize, sz); err != nil {
-				return fmt.Errorf("mlock/munlock error: %s", err)
+			if err := db.mrelock(m, fileSize, sz); err != nil {
+				db.tryRestoreFileSize(fileSize)
+				return fmt.Errorf("mlock/munlock error: %w", err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// tryRestoreFileSize best-effort truncates the file back to fileSize after a
+// failed growth operation. It never grows the file and never overrides the
+// original error.
+func (db *DB) tryRestoreFileSize(fileSize int) {
+	if db.readOnly || db.file == nil || fileSize < 0 {
+		return
+	}
+	info, err := db.file.Stat()
+	if err != nil {
+		db.Logger().Errorf("getting file size failed during rollback: %v", err)
+		return
+	}
+	if info.Size() == int64(fileSize) {
+		return
+	}
+	if info.Size() < int64(fileSize) {
+		return
+	}
+	if err := db.file.Truncate(int64(fileSize)); err != nil {
+		db.Logger().Errorf("[GOOS: %s, GOARCH: %s] restoring file size failed, path: %s, size: %d, error: %v",
+			runtime.GOOS, runtime.GOARCH, db.path, fileSize, err)
+	}
 }
 
 func (db *DB) growSize(mmapSize, growSize int) int {

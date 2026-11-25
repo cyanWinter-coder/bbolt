@@ -5,31 +5,31 @@ package bbolt
 import "golang.org/x/sys/unix"
 
 // mlock locks memory of db file
-func mlock(db *DB, fileSize int) error {
+func mlock(m *mapping, fileSize int) error {
 	sizeToLock := fileSize
-	if sizeToLock > db.datasz {
+	if sizeToLock > m.datasz {
 		// Can't lock more than mmaped slice
-		sizeToLock = db.datasz
+		sizeToLock = m.datasz
 	}
-	if err := unix.Mlock(db.dataref[:sizeToLock]); err != nil {
+	if err := unix.Mlock(m.dataref[:sizeToLock]); err != nil {
 		return err
 	}
 	return nil
 }
 
 // munlock unlocks memory of db file
-func munlock(db *DB, fileSize int) error {
-	if db.dataref == nil {
+func munlock(m *mapping, fileSize int) error {
+	if m == nil || m.dataref == nil {
 		return nil
 	}
 
 	sizeToUnlock := fileSize
-	if sizeToUnlock > db.datasz {
+	if sizeToUnlock > m.datasz {
 		// Can't unlock more than mmaped slice
-		sizeToUnlock = db.datasz
+		sizeToUnlock = m.datasz
 	}
 
-	if err := unix.Munlock(db.dataref[:sizeToUnlock]); err != nil {
+	if err := unix.Munlock(m.dataref[:sizeToUnlock]); err != nil {
 		return err
 	}
 	return nil

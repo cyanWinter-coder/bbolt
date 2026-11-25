@@ -28,6 +28,7 @@ type Tx struct {
 	writable       bool
 	managed        bool
 	db             *DB
+	mapping        *mapping
 	meta           *common.Meta
 	root           *Bucket
 	pages          map[common.Pgid]*common.Page
@@ -48,9 +49,9 @@ func (tx *Tx) init(db *DB) {
 	tx.db = db
 	tx.pages = nil
 
-	// Copy the meta page since it can be changed by the writer.
+	// Copy the meta page from the mapping generation retained by this Tx.
 	tx.meta = &common.Meta{}
-	db.meta().Copy(tx.meta)
+	tx.mapping.meta().Copy(tx.meta)
 
 	// Copy over the root bucket.
 	tx.root = newBucket(tx)
@@ -213,7 +214,7 @@ func (tx *Tx) Commit() (err error) {
 
 	// Free the old freelist because commit writes out a fresh freelist.
 	if tx.meta.Freelist() != common.PgidNoFreelist {
-		tx.db.freelist.Free(tx.meta.Txid(), tx.db.page(tx.meta.Freelist()))
+		tx.db.freelist.Free(tx.meta.Txid(), tx.page(tx.meta.Freelist()))
 	}
 
 	if !tx.db.NoFreelistSync {
@@ -326,15 +327,17 @@ func (tx *Tx) rollback() {
 	}
 	if tx.writable {
 		tx.db.freelist.Rollback(tx.meta.Txid())
-		// When mmap fails, the `data`, `dataref` and `datasz` may be reset to
-		// zero values, and there is no way to reload free page IDs in this case.
-		if tx.db.data != nil {
+		// When mmap fails before the new generation is installed, the
+		// transaction still retains the previous usable generation. Only
+		// reload free pages from disk when a mapping is available.
+		if tx.mapping != nil && tx.mapping.data != nil {
 			if !tx.db.hasSyncedFreelist() {
 				// Reconstruct free page list by scanning the DB to get the whole free page list.
 				// Note: scanning the whole db is heavy if your db size is large in NoSyncFreeList mode.
 				tx.db.freelist.NoSyncReload(tx.db.freepages())
 			} else {
-				// Read free page list from freelist page.
+				// Reload from the last committed meta page, not tx.meta: a
+				// failed commit may have advanced tx.meta to uncommitted pages.
 				tx.db.freelist.Reload(tx.db.page(tx.db.meta().Freelist()))
 			}
 		}
@@ -351,6 +354,15 @@ func (tx *Tx) close() {
 		var freelistFreeN = tx.db.freelist.FreeCount()
 		var freelistPendingN = tx.db.freelist.PendingCount()
 		var freelistAlloc = tx.db.freelist.EstimatedWritePageSize()
+
+		// Release the mapping generation before releasing the writer lock so
+		// Close and the next writer see a fully finished transaction.
+		if tx.mapping != nil {
+			if err := tx.db.releaseMapping(tx.mapping); err != nil {
+				tx.db.Logger().Errorf("releasing write transaction mapping failed: %v", err)
+			}
+			tx.mapping = nil
+		}
 
 		// Remove transaction ref & writer lock.
 		tx.db.rwtx = nil
@@ -635,8 +647,9 @@ func (tx *Tx) page(id common.Pgid) *common.Page {
 		}
 	}
 
-	// Otherwise return directly from the mmap.
-	p := tx.db.page(id)
+	// Otherwise return directly from the mapping generation retained by this
+	// transaction. This keeps old reads on the old mapping after a growth.
+	p := tx.mapping.page(id, tx.db.pageSize)
 	p.FastCheck(id)
 	return p
 }
@@ -676,8 +689,8 @@ func (tx *Tx) Page(id int) (*common.PageInfo, error) {
 		return nil, berrors.ErrFreePagesNotLoaded
 	}
 
-	// Build the page info.
-	p := tx.db.page(common.Pgid(id))
+	// Build the page info from the transaction's retained generation.
+	p := tx.mapping.page(common.Pgid(id), tx.db.pageSize)
 	info := &common.PageInfo{
 		ID:            id,
 		Count:         int(p.Count()),
